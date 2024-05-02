@@ -16,6 +16,8 @@
 #include <tenzir/concept/parseable/string/quoted_string.hpp>
 #include <tenzir/concept/parseable/tenzir/pipeline.hpp>
 #include <tenzir/detail/installdirs.hpp>
+#include <tenzir/detail/overload.hpp>
+#include <tenzir/detail/preserved_fds.hpp>
 #include <tenzir/error.hpp>
 #include <tenzir/generator.hpp>
 #include <tenzir/logger.hpp>
@@ -70,8 +72,9 @@ struct config {
 
 auto drain_pipe(bp::ipstream& pipe) -> std::string {
   auto result = std::string{};
-  if (pipe.peek() == bp::ipstream::traits_type::eof())
+  if (pipe.peek() == bp::ipstream::traits_type::eof()) {
     return result;
+  }
   auto line = std::string{};
   while (std::getline(pipe, line)) {
     if (not result.empty()) {
@@ -155,8 +158,9 @@ public:
         // verified. We truncate it to this length unconditionally for
         // consistency.
         constexpr auto semaphore_name_max_length = 30u;
-        if (sem_name.size() > semaphore_name_max_length)
+        if (sem_name.size() > semaphore_name_max_length) {
           sem_name.erase(semaphore_name_max_length);
+        }
         // The initial venv creation tends to take a very long time, and often
         // causes the pipline creation to take longer then what our FE tolerate
         // in terms of wait time. As a workaround we yield early, so that the
@@ -187,7 +191,10 @@ public:
           // the invocation in a script that drains the pipe continuously but
           // only forwards the first n bytes.
           if (bp::system(python_executable, "-m", "venv", venv,
-                         bp::std_err > std_err)) {
+                         bp::std_err > std_err,
+                         detail::preserved_fds{{STDERR_FILENO}},
+                         boost::process::limit_handles)
+              != 0) {
             auto venv_error = drain_pipe(std_err);
             // We need to delete the potentially broken venv here to make sure
             // that it doesn't stick around to break later runs of the python
@@ -228,7 +235,10 @@ public:
           std_err = bp::ipstream{};
           TENZIR_VERBOSE("installing python modules with: '{}'",
                          fmt::join(pip_invocation, "' '"));
-          if (bp::system(pip_invocation, env, bp::std_err > std_err)) {
+          if (bp::system(pip_invocation, env, bp::std_err > std_err,
+                         detail::preserved_fds{{STDERR_FILENO}},
+                         boost::process::limit_handles)
+              != 0) {
             auto pip_error = drain_pipe(std_err);
             diagnostic::error("{}", pip_error)
               .note("failed to install pip requirements")
@@ -245,15 +255,19 @@ public:
       // deadlock when trying to write to stderr. So we use a separate pipe
       // that's only used by the python executor and has well-defined semantics.
       bp::ipstream errpipe;
-      auto child
-        = bp::child{boost::process::filesystem::path{python_executable},
-                    "-c",
-                    PYTHON_SCAFFOLD,
-                    fmt::to_string(codepipe.pipe().native_source()),
-                    fmt::to_string(errpipe.pipe().native_sink()),
-                    env,
-                    bp::std_out > std_out,
-                    bp::std_in < std_in};
+      auto child = bp::child{
+        boost::process::filesystem::path{python_executable},
+        "-c",
+        PYTHON_SCAFFOLD,
+        fmt::to_string(codepipe.pipe().native_source()),
+        fmt::to_string(errpipe.pipe().native_sink()),
+        env,
+        bp::std_out > std_out,
+        bp::std_in < std_in,
+        detail::preserved_fds{{STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO,
+                               codepipe.pipe().native_source(),
+                               errpipe.pipe().native_sink()}},
+        boost::process::limit_handles};
       if (code.empty()) {
         // The current implementation always expects a non-empty input.
         // Otherwise, it blocks forever on a `read` call.
@@ -265,6 +279,13 @@ public:
       ::close(errpipe.pipe().native_sink());
       co_yield {}; // signal successful startup
       for (auto&& slice : input) {
+        if (!child.running()) {
+          auto python_error = drain_pipe(errpipe);
+          diagnostic::error("{}", python_error)
+            .note("python process exited with error")
+            .emit(ctrl.diagnostics());
+          co_return;
+        }
         if (slice.rows() == 0) {
           co_yield {};
           continue;
@@ -303,13 +324,17 @@ public:
         auto reader = arrow::ipc::RecordBatchStreamReader::Open(&file);
         if (!reader.status().ok()) {
           auto python_error = drain_pipe(errpipe);
-          diagnostic::error("{}", python_error).emit(ctrl.diagnostics());
+          diagnostic::error("{}", python_error)
+            .note("python process exited with error")
+            .emit(ctrl.diagnostics());
           co_return;
         }
         auto result_batch = (*reader)->ReadNext();
         if (!result_batch.status().ok()) {
           auto python_error = drain_pipe(errpipe);
-          diagnostic::error("{}", python_error).emit(ctrl.diagnostics());
+          diagnostic::error("{}", python_error)
+            .note("python process exited with error")
+            .emit(ctrl.diagnostics());
           co_return;
         }
         // The writer on the other side writes an invalid record batch as
@@ -383,18 +408,20 @@ public:
     -> caf::error override {
     auto create_virtualenv
       = try_get_or<bool>(plugin_config, "create-venvs", true);
-    if (!create_virtualenv)
+    if (!create_virtualenv) {
       return create_virtualenv.error();
-    if (!(*create_virtualenv))
+    }
+    if (!(*create_virtualenv)) {
       config.venv_base_dir = std::nullopt;
-    else if (const auto* cache_dir
-             = get_if<std::string>(&global_config, "tenzir.cache-directory"))
+    } else if (const auto* cache_dir = get_if<std::string>(
+                 &global_config, "tenzir.cache-directory")) {
       config.venv_base_dir
         = (std::filesystem::path{*cache_dir} / "python" / "venvs").string();
-    else
+    } else {
       config.venv_base_dir = (std::filesystem::temp_directory_path() / "tenzir"
                               / "python" / "venvs")
                                .string();
+    }
     auto implicit_requirements_default = std::string{
       detail::install_datadir() / "python"
       / fmt::format("tenzir-{}.{}.{}-py3-none-any.whl[operator]",
