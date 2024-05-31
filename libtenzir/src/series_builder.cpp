@@ -337,7 +337,7 @@ public:
     return builder_.list();
   }
 
-  auto total_length() -> int64_t {
+  auto total_length() const -> int64_t {
     auto total = builder_.length();
     for (auto& array : finished_) {
       total += array.length();
@@ -1400,7 +1400,7 @@ auto series_builder::type() -> tenzir::type {
   return impl_->type();
 }
 
-auto series_builder::length() -> int64_t {
+auto series_builder::length() const -> int64_t {
   return impl_->total_length();
 }
 

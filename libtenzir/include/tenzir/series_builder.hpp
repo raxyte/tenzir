@@ -153,7 +153,7 @@ public:
   auto kind() -> type_kind;
 
   /// Returns the number of elements that would be returned by `finish()`.
-  auto length() -> int64_t;
+  auto length() const -> int64_t;
 
   /// Removes the element that is currently being built.
   void remove_last();
