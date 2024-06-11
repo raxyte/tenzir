@@ -3,84 +3,104 @@
 //   | |/ / __ |_\ \  / /          Across
 //   |___/_/ |_/___/ /_/       Space and Time
 //
-// SPDX-FileCopyrightText: (c) 2023 The Tenzir Contributors
+// SPDX-FileCopyrightText: (c) 2024 The Tenzir Contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 #pragma once
 
-#include "tenzir/data.hpp"
 #include "tenzir/defaults.hpp"
 #include "tenzir/detail/assert.hpp"
+#include "tenzir/record_builder.hpp"
 #include "tenzir/series.hpp"
 #include "tenzir/series_builder.hpp"
 #include "tenzir/type.hpp"
-#include "tenzir/variant.hpp"
-#include "tenzir/view.hpp"
 
 #include <arrow/type_fwd.h>
 #include <tsl/robin_map.h>
 
 #include <chrono>
 #include <concepts>
-#include <iterator>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <variant>
 
 namespace tenzir {
+
+class multi_series_builder;
+
 namespace detail::multi_series_builder {
 
 using signature_type = std::vector<std::byte>;
 
-class record_generator;
-
-class field_generator {
-public:
-  field_generator(builder_ref origin) : var_{origin} {
-  }
-  field_generator(tenzir::data& raw, signature_type& sig)
-    : var_{std::in_place_type<raw_type>, raw, sig} {
-  }
-  void data(data_view2 d);
-  void data(tenzir::data d);
-  auto record() -> record_generator;
-
-private:
-  struct raw_type {
-    tenzir::data& raw;
-    signature_type& sig;
-  };
-
-  std::variant<tenzir::builder_ref, raw_type> var_;
-};
+class list_generator;
+class field_generator;
 
 class record_generator {
+  using raw_pointer = detail::record_builder::node_record*;
+
 public:
   explicit record_generator(tenzir::record_ref builder) : var_{builder} {
   }
-  explicit record_generator(tenzir::record& raw, signature_type& sig)
-    : var_{std::in_place_type<raw_type>, raw, sig} {
+  explicit record_generator(raw_pointer raw) : var_{raw} {
   }
 
   auto field(std::string_view name) -> field_generator;
-  void field(std::string_view name, data data);
 
 private:
-  struct raw_type {
-    tenzir::record& raw;
-    signature_type& sig;
-  };
+  std::variant<tenzir::record_ref, raw_pointer> var_;
+};
 
-  std::variant<tenzir::record_ref, raw_type> var_;
+class field_generator {
+  using raw_pointer = detail::record_builder::node_field*;
+
+public:
+  field_generator(builder_ref origin) : var_{origin} {
+  }
+  field_generator(raw_pointer raw) : var_{raw} {
+  }
+  template <tenzir::detail::record_builder::non_structured_data_type T>
+  void data(T d);
+
+  auto record() -> record_generator;
+
+  auto list() -> list_generator;
+
+  void null();
+
+private:
+  std::variant<tenzir::builder_ref, raw_pointer> var_;
+};
+
+class list_generator {
+  using raw_pointer = detail::record_builder::node_list*;
+
+public:
+  list_generator(builder_ref origin) : var_{origin} {
+  }
+  list_generator(raw_pointer raw) : var_{raw} {
+  }
+
+  template <tenzir::detail::record_builder::non_structured_data_type T>
+  void data(T d);
+
+  auto record() -> record_generator;
+
+  auto list() -> list_generator;
+
+  void null();
+
+private:
+  std::variant<tenzir::builder_ref, raw_pointer> var_;
 };
 } // namespace detail::multi_series_builder
 
 class multi_series_builder {
 public:
+  friend class detail::multi_series_builder::record_generator;
+  friend class detail::multi_series_builder::field_generator;
+  friend class detail::multi_series_builder::list_generator;
   using record_generator = detail::multi_series_builder::record_generator;
 
   /// @returns a vector of all currently finished series
@@ -137,12 +157,16 @@ public:
     size_t desired_batch_size = defaults::import::table_slice_size;
   };
 
-  multi_series_builder(policy_type policy, settings s)
-    : policy_{std::move(policy)}, settings_{std::move(s)} {
-      if ( auto p = get_policy<policy_merge>() ) {
-        settings_.ordered = true; // merging mode is necessarily ordered
-        merging_builder_= series_builder{ type_for_schema(p->seed_schema) };
-      }
+  multi_series_builder(policy_type policy, settings s,
+                       std::vector<type> schemas = {})
+    : policy_{std::move(policy)},
+      settings_{std::move(s)},
+      schemas_{std::move(schemas)} {
+    if (auto p = get_policy<policy_merge>()) {
+      settings_.ordered = true; // merging mode is necessarily ordered
+      merging_builder_ = series_builder{
+        type_for_schema(p->seed_schema.value_or(settings_.default_name))};
+    }
   }
 
   multi_series_builder(const multi_series_builder&) = delete;
@@ -158,21 +182,24 @@ public:
   }
 
 private:
+  /// gets a pointer to the active policy, if its the given one.
+  /// the implementation is in the source file, since its a private/internal
+  /// function and thus will only be instantiated by other member functions
   template <typename T>
   T* get_policy();
+
   // called internally once an event is complete.
   // this function is responsible for committing
   // the currently built event to its respective `series_builder`
   // this is only relevant for the precise mode
   void complete_last_event();
 
+  // clears the currently build raw event
+  void clear_raw_event();
+
   // gets the next free index into `entries_`.
   std::optional<size_t> next_free_index() const;
 
-  auto type_for_schema(const std::optional<std::string>&)
-    -> std::optional<std::reference_wrapper<const type>>;
-  auto type_for_schema(std::optional<std::string_view>)
-    -> std::optional<std::reference_wrapper<const type>>;
   auto type_for_schema(std::string_view str)
     -> std::optional<std::reference_wrapper<const type>>;
 
@@ -204,7 +231,7 @@ private:
   void make_events_available_where(std::predicate<const entry_data&> auto pred);
 
   /// appends `new_events` to `ready_events_`
-  void append_ready_events( std::vector<series>&& new_events );
+  void append_ready_events(std::vector<series>&& new_events);
 
   /// GCs `series_builders` from `entries_` that satisfy the predicate
   /// the implementation is in the source file, since its a private/internal
@@ -212,21 +239,17 @@ private:
   void garbage_collect_where(std::predicate<const entry_data&> auto pred);
 
   constexpr static size_t invalid_index = static_cast<size_t>(-1);
-  using signature_type = typename detail::multi_series_builder::signature_type;
+  using signature_type = typename record_builder::signature_type;
 
   policy_type policy_;
   settings settings_;
 
   std::vector<type> schemas_;
 
-  // used when building a raw record in precise mode
-  tenzir::record record_raw_;
-  // used when building a raw record in precise mode
+  record_builder builder_raw_;
   signature_type signature_raw_;
   tsl::robin_map<signature_type, size_t, detail::hash_algorithm_proxy<>>
     signature_map_;
-  tsl::robin_map<std::string, size_t, detail::hash_algorithm_proxy<>>
-    schema_map_;
   series_builder merging_builder_;
   std::vector<entry_data> entries_;
   std::vector<series> ready_events_;
