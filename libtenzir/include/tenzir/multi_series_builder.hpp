@@ -16,6 +16,7 @@
 #include "tenzir/type.hpp"
 
 #include <arrow/type_fwd.h>
+#include <caf/error.hpp>
 #include <tsl/robin_map.h>
 
 #include <chrono>
@@ -45,7 +46,7 @@ public:
   }
   explicit record_generator(raw_pointer raw) : var_{raw} {
   }
-
+  /// adds a new field to the record and returns a generator for that field
   auto field(std::string_view name) -> field_generator;
 
 private:
@@ -60,13 +61,30 @@ public:
   }
   field_generator(raw_pointer raw) : var_{raw} {
   }
-  template <tenzir::detail::record_builder::non_structured_data_type T>
-  void data(T d);
 
+  /// sets the value of the field to some data
+  template <tenzir::detail::record_builder::non_structured_data_type T>
+  void data(T d) {
+    const auto visitor = detail::overload{
+      [&](tenzir::builder_ref& b) {
+        b.data(d);
+      },
+      [&](raw_pointer raw) {
+        raw->data(d);
+      },
+    };
+    return std::visit(visitor, var_);
+  }
+
+  /// sets the value of the field an empty record and returns a generator for
+  /// the record
   auto record() -> record_generator;
 
+  /// sets the value of the field an empty list and returns a generator for the
+  /// list
   auto list() -> list_generator;
 
+  /// sets the value of the field to null
   void null();
 
 private:
@@ -82,13 +100,26 @@ public:
   list_generator(raw_pointer raw) : var_{raw} {
   }
 
+  /// appends a data value T to the list
   template <tenzir::detail::record_builder::non_structured_data_type T>
-  void data(T d);
-
+  void data(T d) {
+    const auto visitor = detail::overload{
+      [&](tenzir::builder_ref& b) {
+        b.data(d);
+      },
+      [&](raw_pointer raw) {
+        raw->data(d);
+      },
+    };
+    return std::visit(visitor, var_);
+  }
+  /// appends a record to the list and returns a generator for the record
   auto record() -> record_generator;
 
+  /// appends a list to the list and returns a generator for the list
   auto list() -> list_generator;
 
+  /// append a null value to the list
   void null();
 
 private:
@@ -107,9 +138,13 @@ public:
   [[nodiscard("The result of a flush must be handled")]]
   auto yield_ready() -> std::vector<series>;
 
+  [[nodiscard("The result of a flush must be handled")]]
+  auto last_errors() -> std::vector<caf::error>; // FIXME implement this
+
   /// adds a record to the currently active builder
   [[nodiscard]] auto record() -> record_generator;
 
+  /// drops the last event from active builder
   void remove_last();
 
   [[nodiscard("The result of a flush must be handled")]]
@@ -243,7 +278,7 @@ private:
 
   policy_type policy_;
   settings settings_;
-
+  std::function<caf::expected<tenzir::data>(std::string,const tenzir::type*)> parser_;
   std::vector<type> schemas_;
 
   record_builder builder_raw_;
@@ -253,6 +288,7 @@ private:
   series_builder merging_builder_;
   std::vector<entry_data> entries_;
   std::vector<series> ready_events_;
+  std::vector<caf::error> errors_;
   std::chrono::steady_clock::time_point last_yield_time_
     = std::chrono::steady_clock::now();
   size_t active_index_ = invalid_index;

@@ -10,10 +10,13 @@
 #include "tenzir/fwd.hpp"
 
 #include "tenzir/aliases.hpp"
+#include "tenzir/detail/assert.hpp"
 #include "tenzir/detail/flat_map.hpp"
 #include "tenzir/series_builder.hpp"
 
 #include <caf/detail/type_list.hpp>
+#include <caf/error.hpp>
+#include <caf/expected.hpp>
 
 #include <cstddef>
 #include <string>
@@ -24,29 +27,51 @@
 namespace tenzir {
 
 class record_builder;
-
 namespace detail::record_builder {
+
+template <typename T>
+concept data_parsing_function = requires(T t, std::string s, const tenzir::type* seed) {
+  { t(s,seed) } -> std::same_as<caf::expected<tenzir::data>>;
+};
+
+class node_record;
+class node_field;
+class node_list;
+
+struct map_dummy {};
+struct pattern_dummy {};
+struct enriched_dummy {};
+// The indices in this MUST line up with the tenzir type indices, hence the
+// dummies
 // clang-format off
-using atomic_types = caf::detail::type_list<
-  caf::none_t,
-  bool,
-  int64_t,
+using field_type_list = caf::detail::type_list<
+  caf::none_t, 
+  bool, 
+  int64_t, 
   uint64_t,
-  double,
-  duration,
-  time,
+  double, 
+  duration, 
+  time, 
   std::string,
-  pattern,
-  ip,
-  subnet,
-  enumeration,
+  pattern_dummy,
+  ip, 
+  subnet, 
+  enumeration, 
+  node_list,
+  map_dummy, 
+  node_record, 
+  enriched_dummy,
   blob
 >;
 // clang-format on
 
 template <typename T>
 concept non_structured_data_type
-  = caf::detail::tl_contains<atomic_types, T>::value;
+  = caf::detail::tl_contains<field_type_list, T>::value
+    and not caf::detail::tl_contains<
+      caf::detail::type_list<node_record, node_list, pattern_dummy, map_dummy,
+                             enriched_dummy>,
+      T>::value;
 
 using signature_type = std::vector<std::byte>;
 
@@ -67,22 +92,14 @@ private:
   auto mark_this_dead() -> void {
     state_ = state::dead;
   }
+  auto mark_this_alive() -> void {
+    state_ = state::alive;
+  }
   auto is_dead() const -> bool;
   auto is_alive() const -> bool;
   auto affects_signature() const -> bool;
-  auto clear() -> void;
-  state state_;
+  state state_ = state::alive;
 };
-
-class node_record;
-class node_field;
-class node_list;
-// clang-format off
-using field_type_list = caf::detail::tl_union_t<
-    atomic_types,
-    caf::detail::type_list<node_list,node_record, std::monostate>
-  >;
-// clang-format on
 
 class node_record : public node_base {
   friend class node_list;
@@ -98,7 +115,7 @@ public:
   /// @note the returned pointer is not permanently stable. If the underlying
   /// vector reallocates, the pointer becomes invalid
   /// @ref reserve can be used to ensure stability for a given number of elements
-  auto field(std::string_view name) -> node_field*;
+  [[nodiscard]] auto field(std::string_view name) -> node_field*;
 
 private:
   // tries to get a field with the given name. Does not affect any field state
@@ -109,19 +126,26 @@ private:
   // does lookup of a (nested( key
   auto at(std::string_view key) -> node_field*;
   // writes the record into a series builder
-  auto commit_to(tenzir::record_ref r) -> void;
+  auto commit_to(tenzir::record_ref r, bool mark_dead = true) -> void;
+  auto commit_to(tenzir::record& r, bool mark_dead = true) -> void;
   // append the signature of this record to `sig`.
   // including sentinels is important for signature computation
-  auto append_to_signature(signature_type& sig, const tenzir::record_type* seed
-                                                = nullptr) -> void;
+  template <data_parsing_function Parser>
+  auto
+  append_to_signature(signature_type& sig, Parser& p,
+                      const tenzir::record_type* seed = nullptr) -> caf::error;
   // clears the record by marking everything as dead
   auto clear() -> void;
 
   // record entry. contains a string for the key and a field
-  // its defined out of line because field cannot be defined at this point
+  // its defined out of line because node_field cannot be defined at this point
   struct entry_type;
   // this stores added fields in order of their appearance
   // this order is used for committing to the series builder
+  // Using the appearance order to commit, ensures that fields outside of a
+  // possible seed schema retain their order from first appearance The order of
+  // fields in a seed/selector on the other hand is then practically ensured
+  // because the multi_series_builder first seeds the respective series_builder
   std::vector<entry_type> data_;
   // this is a SORTED key -> index map. this is used for signature computation
   // if this map is not sorted, the signature computation algorithm breaks
@@ -140,35 +164,46 @@ public:
   /// this function can be used to get temporary pointer stability on the
   /// records elements
   auto reserve(size_t N) -> void;
-  /// adds a new value to the list
+  /// appends a new typed value to this list
+  /// if its type mismatches with the seed during the later parsing/signature
+  /// computation, an error is returned
   template <non_structured_data_type T>
   auto data(T data) -> void;
+  /// unpacks the tenzir::data into a new element at the end of th list
+  auto data(tenzir::data) -> void;
+  /// adds an unparsed data value to this field. It is later parsed during the
+  /// signature computation step
+  auto data_unparsed(std::string) -> void;
   /// adds a null value to the list
   auto null() -> void;
   /// adds a new record to the list
   /// @note the returned pointer is not permanently stable. If the underlying
   /// vector reallocates, the pointer becomes invalid
   /// @ref reserve can be used to ensure stability for a given number of elements
-  auto record() -> node_record*;
+  [[nodiscard]] auto record() -> node_record*;
   /// adds a new list to the list
   /// @note the returned pointer is not permanently stable. If the underlying
   /// vector reallocates, the pointer becomes invalid
   /// @ref reserve can be used to ensure stability for a given number of elements
-  auto list() -> node_list*;
+  [[nodiscard]] auto list() -> node_list*;
 
 private:
-  /// finds an element marked as dead. This is part of the reallocation optimization.
+  /// finds an element marked as dead. This is part of the reallocation
+  /// optimization.
   auto find_free() -> node_field*;
 
   // (re-)seeds the field to match the given type. If the field is alive, this
   // has no effect
   auto reseed(const tenzir::list_type&) -> void;
   // writes the list into a series builder
-  auto commit_to(tenzir::builder_ref r) -> void;
+  auto commit_to(tenzir::builder_ref r, bool mark_dead = true) -> void;
+  auto commit_to(tenzir::list& r, bool mark_dead = true) -> void;
   // append the signature of this list to `sig`.
   // including sentinels is important for signature computation
-  auto append_to_signature(signature_type& sig, const tenzir::list_type* seed
-                                                = nullptr) -> void;
+  template <data_parsing_function Parser>
+  auto
+  append_to_signature(signature_type& sig, Parser& p,
+                      const tenzir::list_type* seed = nullptr) -> caf::error;
   auto clear() -> void;
 
   size_t type_index_;
@@ -182,13 +217,21 @@ class node_field : public node_base {
   friend class ::tenzir::record_builder;
 
 public:
+  /// sets this field to a parsed, typed data value
+  /// if its type mismatches with the seed during the later parsing/signature
+  /// computation, an error is returned
   template <non_structured_data_type T>
   auto data(T data) -> void;
+  /// unpacks the tenzir::data into this field
+  auto data(tenzir::data) -> void;
+  /// adds an unparsed data value to this field. It is later parsed during the
+  /// signature computation step
+  auto data_unparsed(std::string raw_text) -> void;
   auto null() -> void;
-  auto record() -> node_record*;
-  auto list() -> node_list*;
+  [[nodiscard]] auto record() -> node_record*;
+  [[nodiscard]] auto list() -> node_list*;
 
-  node_field() : data_{std::in_place_type<std::monostate>} {
+  node_field() : data_{std::in_place_type<caf::none_t>} {
   }
   template <non_structured_data_type T>
   node_field(T data) : data_{std::in_place_type<T>, data} {
@@ -199,25 +242,23 @@ private:
     return data_.index();
   }
   template <typename T>
-  auto is() const -> bool {
-    return std::holds_alternative<T>(data_);
-  }
-  auto is_incomplete() const -> bool {
-    return is<std::monostate>();
-  }
-  template <typename T>
   auto get_if() -> T* {
     return std::get_if<T>(&data_);
   }
   // (re-)seeds the field to match the given type. If the field is alive, this
   // has no effect
   auto reseed(const tenzir::type&) -> void;
-  // writes the field into a series builder
-  auto commit_to(tenzir::builder_ref r) -> void;
+  // parses the current un-parsed value if any
+  template <data_parsing_function Parser>
+  auto parse(Parser&, const tenzir::type* seed) -> caf::error;
   // append the signature of this field to `sig`.
   // including sentinels is important for signature computation
-  auto append_to_signature(signature_type& sig, const tenzir::type* seed
-                                                = nullptr) -> void;
+  template <data_parsing_function Parser>
+  auto append_to_signature(signature_type& sig, Parser& p,
+                           const tenzir::type* seed = nullptr) -> caf::error;
+  // writes the field into a series builder
+  auto commit_to(tenzir::builder_ref r, bool mark_dead = true) -> void;
+  auto commit_to(tenzir::data& r, bool mark_dead = true) -> void;
   auto clear() -> void;
 
   // clang-format off
@@ -228,6 +269,7 @@ private:
   // clang-format on
 
   field_variant_type data_;
+  bool is_raw_ = false;
 };
 
 struct node_record::entry_type {
@@ -238,30 +280,39 @@ struct node_record::entry_type {
   }
 };
 
+constexpr static std::byte record_start_marker{0xfa};
+constexpr static std::byte record_end_marker{0xfb};
+
+constexpr static std::byte list_start_marker{0xfc};
+constexpr static std::byte list_end_marker{0xfd};
+
 } // namespace detail::record_builder
 
 class record_builder {
 public:
-  // starts a new record in this builder
-  auto record() -> detail::record_builder::node_record*;
+  record_builder() {
+    root_.mark_this_dead();
+  }
+  // accesses the currently building record
+  [[nodiscard]] auto record() -> detail::record_builder::node_record*;
 
-  auto is_empty() -> bool {
-    return root_.state_ != detail::record_builder::state::dead;
+  [[nodiscard]] auto has_elements() -> bool {
+    return root_.is_alive();
   }
 
-  auto type() -> tenzir::type; // TODO implement this. Maybe.
+  [[nodiscard]] auto type() -> tenzir::type; // TODO implement this. Maybe.
 
   // (re-)seeds the record builder with a given type. Already existant fields
   // are not removed, only possible conflict resolved towards string
   auto reseed(std::optional<tenzir::type> seed) -> void;
 
   /// tries to find a field with the given (nested) key
-  auto
+  [[nodiscard]] auto
   find_field_raw(std::string_view key) -> detail::record_builder::node_field*;
 
   /// tries to find a field with the given (nested) key for a data type
   template <detail::record_builder::non_structured_data_type T>
-  auto find_value_typed(std::string_view key) -> T*;
+  [[nodiscard]] auto find_value_typed(std::string_view key) -> T*;
 
   /// TODO it may still be possible to compute the signature "live"
   /// each node would need a pointer to the builder to write to a member there.
@@ -269,8 +320,10 @@ public:
   /// this depends on whether we have an insertion order stable map
   using signature_type = typename detail::record_builder::signature_type;
   /// computes the "signature" of the currently built record.
-  auto append_signature_to(signature_type&,
-                           std::optional<tenzir::type> seed) -> void;
+  template <detail::record_builder::data_parsing_function Parser>
+  auto append_signature_to(signature_type&, Parser& p,
+                           std::optional<tenzir::type> seed
+                           = std::nullopt) -> caf::error;
 
   /// clears the builder
   void clear();
@@ -278,11 +331,239 @@ public:
   void free();
 
   /// materializes the currently build record
-  auto materialize() const -> tenzir::record; // TODO implement this
+  /// @param mark_dead whether to mark nodes in the record builder as dead
+  [[nodiscard]] auto
+  materialize(bool mark_dead = true) -> tenzir::record; // TODO implement this
   /// commits the current record into the series builder
-  void commit_to(series_builder&);
+  /// @param mark_dead whether to mark nodes in the record builder as dead
+  auto commit_to(series_builder&, bool mark_dead = true) -> void;
 
 private:
   detail::record_builder::node_record root_;
 };
+
+template <detail::record_builder::non_structured_data_type T>
+auto record_builder::find_value_typed(std::string_view key) -> T* {
+  if (auto p = find_field_raw(key)) {
+    return p->get_if<T>();
+  }
+  return nullptr;
+}
+
+template <detail::record_builder::data_parsing_function Parser>
+auto record_builder::append_signature_to(signature_type& sig, Parser& p,
+                                         std::optional<tenzir::type> seed)
+  -> caf::error {
+  if (seed) {
+    auto* seed_as_record_type = caf::get_if<tenzir::record_type>(&*seed);
+    TENZIR_ASSERT(seed_as_record_type);
+    return root_.append_to_signature(sig, p, seed_as_record_type);
+  }
+  return root_.append_to_signature(sig, p);
+}
+
+namespace detail::record_builder {
+template <data_parsing_function Parser>
+auto node_record::append_to_signature(signature_type& sig, Parser& p,
+                                      const tenzir::record_type* seed)
+  -> caf::error {
+  sig.push_back(record_start_marker);
+
+  // if we have a seed, we need too ensure that all fields exist first
+  if (seed) {
+    for (const auto& [k, v] : seed->fields()) {
+      try_field(k)->mark_this_relevant();
+    }
+  }
+  // we are intentionally traversing `lookup_` here, because that is sorted by
+  // name. this ensures that the signature computation will be the same
+  for (const auto& [k, index] : lookup_) {
+    auto& field = data_[index].value;
+    if (field.affects_signature()) {
+      tenzir::type field_seed;
+      if (seed) {
+        // TODO is this a good idea????? I dont see any other way to
+        // find the type for a field with a given name
+        // a non-generator based API to get these would be ideal, so
+        // we dont have to iterate for every key
+        for (auto [seed_key, seed_type] : seed->fields()) {
+          if (seed_key == k) {
+            field_seed = std::move(seed_type);
+            break;
+          }
+        }
+      }
+      const auto key_bytes = as_bytes(k);
+      sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
+      auto e = field.append_to_signature(sig, p, seed ? &field_seed : nullptr);
+      if (e) {
+        return e;
+      }
+    }
+  }
+  sig.push_back(record_end_marker);
+  return {};
+}
+
+template <non_structured_data_type T>
+auto node_field::data(T data) -> void {
+  mark_this_alive();
+  is_raw_ = false;
+  data_.emplace<T>(std::move(data));
+}
+
+template <data_parsing_function Parser>
+auto node_field::parse(Parser& p, const tenzir::type* seed) -> caf::error {
+  if (not is_raw_) {
+    return {};
+  }
+  TENZIR_ASSERT(std::holds_alternative<std::string>(data_));
+  std::string& raw = std::get<std::string>(data_);
+  auto res = p(std::move(raw),seed);
+  if (res) {
+    data(*res);
+    return {};
+  }
+  return res.error();
+}
+
+template <data_parsing_function Parser>
+auto node_field::append_to_signature(signature_type& sig, Parser& p,
+                                     const tenzir::type* seed) -> caf::error {
+  if (is_raw_) {
+    auto e = parse(p,seed);
+    if (e != caf::error{}) {
+      return e;
+    }
+  }
+
+  const auto visitor = detail::overload{
+    [&sig, &p, seed](node_list& v) {
+      const auto* ls = caf::get_if<list_type>(seed);
+      if (seed and not ls) {
+        return caf::make_error(ec::type_clash,
+                               "field holds list but seed is not a list");
+      }
+      if (v.affects_signature() or ls) {
+        return v.append_to_signature(sig, p, ls);
+      }
+      return caf::error{};
+    },
+    [&sig, &p, seed](node_record& v) {
+      const auto* rs = caf::get_if<record_type>(seed);
+      if (seed and not rs) {
+        return caf::make_error(ec::type_clash,
+                               "field holds record but seed is not a record");
+      }
+      if (v.affects_signature() or rs) {
+        return v.append_to_signature(sig, p, rs);
+      }
+      return caf::error{};
+    },
+    [&sig, seed]<non_structured_data_type T>(T&) {
+      size_t type_idx = caf::detail::tl_index_of<field_type_list, T>::value;
+      sig.push_back(static_cast<std::byte>(type_idx));
+      return caf::error{};
+    },
+    [](auto&) {
+      TENZIR_UNREACHABLE();
+      return caf::make_error(ec::unimplemented);
+    },
+  };
+  return std::visit(visitor, data_);
+}
+
+static inline auto is_structural(size_t idx) -> bool {
+  switch (idx) {
+    case caf::detail::tl_index_of<field_type_list, node_list>::value:
+    case caf::detail::tl_index_of<field_type_list, node_record>::value:
+      return true;
+    default:
+      return false;
+  }
+}
+
+constexpr static size_t type_index_empty
+  = caf::detail::tl_size<field_type_list>::value;
+constexpr static size_t type_index_generic_number
+  = caf::detail::tl_index_of<field_type_list, double>::value;
+constexpr static size_t type_index_string
+  = caf::detail::tl_index_of<field_type_list, std::string>::value;
+constexpr static size_t type_index_list
+  = caf::detail::tl_index_of<field_type_list, node_list>::value;
+constexpr static size_t type_index_record
+  = caf::detail::tl_index_of<field_type_list, node_record>::value;
+
+static inline auto is_null(size_t idx) -> bool {
+  return idx == caf::detail::tl_index_of<field_type_list, caf::none_t>::value;
+}
+
+static inline auto is_number_like(size_t idx) -> auto {
+  switch (idx) {
+    case caf::detail::tl_index_of<field_type_list, bool>::value:
+    case caf::detail::tl_index_of<field_type_list, int64_t>::value:
+    case caf::detail::tl_index_of<field_type_list, uint64_t>::value:
+    case caf::detail::tl_index_of<field_type_list, double>::value:
+    case caf::detail::tl_index_of<field_type_list, enumeration>::value:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static inline auto update_type_index(size_t& old_index, size_t new_index) -> void {
+  if (old_index == new_index) {
+    return;
+  }
+  if (old_index == type_index_empty) {
+    old_index = new_index;
+    return;
+  }
+  if (is_null(old_index)) {
+    old_index = new_index;
+    return;
+  }
+  if (is_null(new_index)) {
+    return;
+  }
+  if (is_number_like(old_index) and is_number_like(new_index)) {
+    old_index = type_index_generic_number;
+    return;
+  }
+  // TODO converting numbers to durations&times
+  old_index = type_index_string;
+}
+
+template <non_structured_data_type T>
+auto node_list::data(T data) -> void {
+  mark_this_alive();
+  if (auto* free = find_free()) {
+    free->data(std::move(data));
+    update_type_index(type_index_, free->current_index());
+  } else {
+    TENZIR_ASSERT(data_.size() <= 20'000, "Upper limit on list size reached.");
+    data_.emplace_back(std::move(data));
+    update_type_index(type_index_, data_.back().current_index());
+  }
+}
+
+template <data_parsing_function Parser>
+auto node_list::append_to_signature(
+  /// TODO update signature computation after parsing of fields
+  signature_type& sig, Parser& p, const tenzir::list_type* seed) -> caf::error {
+  sig.push_back(list_start_marker);
+  if (data_.empty() and not seed) {
+    return {};
+  }
+  sig.push_back(static_cast<std::byte>(type_index_));
+  if (is_structural(type_index_)) {
+    if (seed) {
+      const auto s = seed->value_type();
+      return data_.front().append_to_signature(sig, p, &s);
+    }
+  }
+  sig.push_back(list_end_marker);
+  return {};
+}
+} // namespace detail::record_builder
 } // namespace tenzir

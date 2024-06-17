@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <variant>
 
 namespace tenzir {
@@ -46,94 +47,46 @@ data materialize(data_view2&& v) {
 }
 
 void append_name_to_signature(std::string_view x, signature_type& out) {
-  out.push_back(std::byte{255});
   auto name_bytes = as_bytes(x);
   out.insert(out.end(), name_bytes.begin(), name_bytes.end());
-}
-
-void append_to_signature(const data& x, signature_type& out) {
-  caf::visit(
-    [&]<typename T>(const T& x) {
-      if constexpr (caf::detail::is_one_of<T, pattern, enumeration, map>::value) {
-        // Such values are not produced by `json_to_data`.
-        TENZIR_UNREACHABLE();
-      } else {
-        using Type = data_to_type_t<T>;
-        // Write out the type index. For complex types, this marks the start.
-        out.push_back(static_cast<std::byte>(Type::type_index));
-        if constexpr (basic_type<Type>) {
-          // We are done, no need for recursion.
-        } else {
-          // We have already written out the type index as a prefix and now do
-          // recursion with the inner types.
-          if constexpr (std::same_as<T, record>) {
-            for (auto& [name, value] : x) {
-              // Start a new field with a special marker.
-              out.push_back(std::byte{255});
-              // The field name is part of the type signature.
-              auto name_bytes = as_bytes(name);
-              out.insert(out.end(), name_bytes.begin(), name_bytes.end());
-              // And then, of course, the type of the field.
-              append_to_signature(value, out);
-            }
-          } else if constexpr (std::same_as<T, list>) {
-            for (auto& item : x) {
-              append_to_signature(item, out);
-            }
-          } else {
-            static_assert(detail::always_false_v<T>, "unhandled type");
-          }
-          // We write out the type index once more to mark the end.
-          out.push_back(static_cast<std::byte>(Type::type_index));
-        }
-      }
-    },
-    x);
 }
 } // namespace
 
 namespace detail::multi_series_builder {
 
 auto record_generator::field(std::string_view name) -> field_generator {
-  const auto visitor
-    = detail::overload{[&](tenzir::record_ref& rec) {
-                         return field_generator{rec.field(name)};
-                       },
-                       [&](raw_pointer raw) {
-                         return field_generator{raw->field(name)};
-                       }};
-  return std::visit(visitor, var_);
-}
-
-template <tenzir::detail::record_builder::non_structured_data_type T>
-void field_generator::data(T d) {
-  const auto visitor = detail::overload{[&](tenzir::builder_ref& b) {
-                                          b.data(d);
-                                        },
-                                        [&](raw_pointer raw) {
-                                          raw->data(d);
-                                        }};
+  const auto visitor = detail::overload{
+    [&](tenzir::record_ref& rec) {
+      return field_generator{rec.field(name)};
+    },
+    [&](raw_pointer raw) {
+      return field_generator{raw->field(name)};
+    },
+  };
   return std::visit(visitor, var_);
 }
 
 auto field_generator::record() -> record_generator {
-  const auto visitor
-    = detail::overload{[&](tenzir::builder_ref& b) {
-                         return record_generator{b.record()};
-                       },
-                       [&](raw_pointer raw) {
-                         return record_generator{raw->record()};
-                       }};
+  const auto visitor = detail::overload{
+    [&](tenzir::builder_ref& b) {
+      return record_generator{b.record()};
+    },
+    [&](raw_pointer raw) {
+      return record_generator{raw->record()};
+    },
+  };
   return std::visit(visitor, var_);
 }
 
 auto field_generator::list() -> list_generator {
-  const auto visitor = detail::overload{[&](tenzir::builder_ref& b) {
-                                          return list_generator{b.list()};
-                                        },
-                                        [&](raw_pointer raw) {
-                                          return list_generator{raw->list()};
-                                        }};
+  const auto visitor = detail::overload{
+    [&](tenzir::builder_ref& b) {
+      return list_generator{b.list()};
+    },
+    [&](raw_pointer raw) {
+      return list_generator{raw->list()};
+    },
+  };
   return std::visit(visitor, var_);
 }
 
@@ -165,6 +118,10 @@ auto multi_series_builder::yield_ready() -> std::vector<series> {
   return std::exchange(ready_events_, {});
 }
 
+auto multi_series_builder::last_errors() -> std::vector<caf::error> {
+  return std::exchange(errors_, {});
+}
+
 auto multi_series_builder::record() -> record_generator {
   if (get_policy<policy_merge>()) {
     return record_generator{merging_builder_.record()};
@@ -179,7 +136,7 @@ void multi_series_builder::remove_last() {
     merging_builder_.remove_last();
     return;
   }
-  if (not builder_raw_.is_empty()) {
+  if (not builder_raw_.has_elements()) {
     builder_raw_.clear();
     return;
   }
@@ -207,17 +164,13 @@ void multi_series_builder::complete_last_event() {
   if (get_policy<policy_merge>()) {
     return; // merging mode just writes directly into a series builder
   }
-  if (builder_raw_.is_empty()) {
+  if (not builder_raw_.has_elements()) {
     return; // an empty raw field does not need to be written back
   }
-  size_t new_index = invalid_index;
-  // TODO technically we only need this to be a full string in selector mode
-  // for all other cases it could be a view
   std::string schema_name;
   if (auto p = get_policy<policy_selector>()) {
-    const std::string_view selector = p->field_name;
     auto* selected_schema
-      = builder_raw_.find_value_typed<std::string>(selector);
+      = builder_raw_.find_value_typed<std::string>(p->field_name);
     if (selected_schema) {
       if (p->naming_prefix) {
         schema_name = fmt::format("{}.{}", p->naming_prefix, *selected_schema);
@@ -236,8 +189,14 @@ void multi_series_builder::complete_last_event() {
   signature_raw_.clear();
   append_name_to_signature(schema_name, signature_raw_);
   const auto schema_type = type_for_schema(schema_name);
-  builder_raw_.reseed(schema_type); // re-seed
-  builder_raw_.append_signature_to(signature_raw_,schema_type);
+  auto e
+    = builder_raw_.append_signature_to(signature_raw_, parser_, schema_type);
+  if (e) {
+    errors_.push_back(std::move(e));
+    signature_raw_.clear();
+    builder_raw_.clear();
+    return;
+  }
   auto free_index = next_free_index();
   auto [it, inserted] = signature_map_.try_emplace(
     std::move(signature_raw_), free_index.value_or(entries_.size()));
@@ -248,7 +207,7 @@ void multi_series_builder::complete_last_event() {
       entries_[it->second].unused = false;
     }
   }
-  new_index = it->second;
+  const auto new_index = it->second;
   if (settings_.ordered and new_index != active_index_) {
     // Because it's the ordered mode, we know that that only this single
     // series builder can be active and hold elements. Since the active

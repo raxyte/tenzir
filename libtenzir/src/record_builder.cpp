@@ -10,17 +10,25 @@
 
 #include "tenzir/fwd.hpp"
 
+#include "tenzir/aliases.hpp"
 #include "tenzir/as_bytes.hpp"
 #include "tenzir/data.hpp"
 #include "tenzir/detail/assert.hpp"
 #include "tenzir/detail/overload.hpp"
+#include "tenzir/detail/type_list.hpp"
 #include "tenzir/index.hpp"
+#include "tenzir/legacy_type.hpp"
+#include "tenzir/logger.hpp"
 #include "tenzir/series_builder.hpp"
+#include "tenzir/subnet.hpp"
 #include "tenzir/type.hpp"
 
 #include <arrow/compute/expression.h>
 #include <caf/detail/type_list.hpp>
+#include <caf/error.hpp>
 #include <caf/none.hpp>
+#include <caf/sum_type.hpp>
+#include <fmt/core.h>
 
 #include <algorithm>
 #include <ranges>
@@ -29,27 +37,10 @@
 #include <utility>
 #include <variant>
 
-#define PARENS ()
-#define EXPAND(...) EXPAND4(EXPAND4(EXPAND4(EXPAND4(__VA_ARGS__))))
-#define EXPAND4(...) EXPAND3(EXPAND3(EXPAND3(EXPAND3(__VA_ARGS__))))
-#define EXPAND3(...) EXPAND2(EXPAND2(EXPAND2(EXPAND2(__VA_ARGS__))))
-#define EXPAND2(...) EXPAND1(EXPAND1(EXPAND1(EXPAND1(__VA_ARGS__))))
-#define EXPAND1(...) __VA_ARGS__
-
-#define FOR_EACH(macro, ...)                                                   \
-  __VA_OPT__(EXPAND(FOR_EACH_HELPER(macro, __VA_ARGS__)))
-#define FOR_EACH_HELPER(macro, a1, ...)                                        \
-  macro(a1) __VA_OPT__(FOR_EACH_AGAIN PARENS(macro, __VA_ARGS__))
-#define FOR_EACH_AGAIN() FOR_EACH_HELPER
-
-/// types that can be `data` but aren't nested/recursive
-#define NON_STRUCTURED_TYPES                                                   \
-  caf::none_t, bool, int64_t, uint64_t, double, duration, time, std::string,   \
-    ip, subnet, enumeration, blob
-
 namespace tenzir {
 
 auto record_builder::record() -> detail::record_builder::node_record* {
+  root_.mark_this_alive();
   return &root_;
 }
 
@@ -64,31 +55,8 @@ auto record_builder::find_field_raw(std::string_view key)
   return root_.at(key);
 }
 
-template <detail::record_builder::non_structured_data_type T>
-auto record_builder::find_value_typed(std::string_view key) -> T* {
-  if (auto p = find_field_raw(key)) {
-    return p->get_if<T>();
-  }
-  return nullptr;
-}
-
-#define INSTANTIATE_record_builder_find_value_typed(T)                         \
-  template auto record_builder::find_value_typed<T>(std::string_view)->T*;
-
-FOR_EACH(INSTANTIATE_record_builder_find_value_typed, NON_STRUCTURED_TYPES)
-
 auto record_builder::clear() -> void {
   root_.clear();
-}
-
-auto record_builder::append_signature_to(
-  signature_type& sig, std::optional<tenzir::type> seed) -> void {
-  if (seed) {
-    auto rs = caf::get_if<tenzir::record_type>(&*seed);
-    root_.append_to_signature(sig, rs);
-  } else {
-    root_.append_to_signature(sig);
-  }
 }
 
 auto record_builder::free() -> void {
@@ -98,59 +66,47 @@ auto record_builder::free() -> void {
   root_.lookup_.shrink_to_fit();
 }
 
-auto record_builder::commit_to(series_builder& builder) -> void {
-  root_.commit_to(builder.record());
+auto record_builder::commit_to(series_builder& builder,
+                               bool mark_dead) -> void {
+  root_.commit_to(builder.record(), mark_dead);
+}
+
+auto record_builder::materialize(bool mark_dead) -> tenzir::record {
+  tenzir::record res;
+  root_.commit_to(res, mark_dead);
+
+  return res;
 }
 
 namespace detail::record_builder {
 namespace {
 
-constexpr static size_t type_index_empty
-  = caf::detail::tl_size<field_type_list>::value;
-constexpr static size_t type_index_generic_number
-  = caf::detail::tl_index_of<field_type_list, double>::value;
-constexpr static size_t type_index_string
-  = caf::detail::tl_index_of<field_type_list, std::string>::value;
-constexpr static size_t type_index_list
-  = caf::detail::tl_index_of<field_type_list, node_list>::value;
-constexpr static size_t type_index_record
-  = caf::detail::tl_index_of<field_type_list, node_record>::value;
-bool is_null(size_t idx) {
-  return idx == caf::detail::tl_index_of<field_type_list, caf::none_t>::value;
-}
-bool is_number_like(size_t idx) {
-  switch (idx) {
-    case caf::detail::tl_index_of<field_type_list, bool>::value:
-    case caf::detail::tl_index_of<field_type_list, int64_t>::value:
-    case caf::detail::tl_index_of<field_type_list, uint64_t>::value:
-    case caf::detail::tl_index_of<field_type_list, double>::value:
-    case caf::detail::tl_index_of<field_type_list, enumeration>::value:
-      return true;
-    default:
-      return false;
-  }
-}
+template <typename Field, typename Tenzir_Type>
+struct index_regression_tester {
+  constexpr static auto index_in_field
+    = caf::detail::tl_index_of<field_type_list, Field>::value;
+  constexpr static auto tenzir_type_index = Tenzir_Type::type_index;
 
-auto update_type_index(size_t& old_index, size_t new_index) -> void {
-  if (old_index == new_index) {
-    return;
-  }
-  if (old_index == type_index_empty) {
-    old_index = new_index;
-    return;
-  }
-  if (is_null(old_index)) {
-    old_index = new_index;
-    return;
-  }
-  if (is_null(new_index)) {
-    return;
-  }
-  if (is_number_like(old_index) and is_number_like(new_index)) {
-    old_index = type_index_generic_number;
-    return;
-  }
-  old_index = type_index_string;
+  static_assert(index_in_field == tenzir_type_index);
+
+  using type = void;
+};
+
+[[maybe_unused]] consteval void test() {
+  (void)index_regression_tester<caf::none_t, null_type>{};
+  (void)index_regression_tester<int64_t, int64_type>{};
+  (void)index_regression_tester<uint64_t, uint64_type>{};
+  (void)index_regression_tester<double, double_type>{};
+  (void)index_regression_tester<duration, duration_type>{};
+  (void)index_regression_tester<time, time_type>{};
+  (void)index_regression_tester<std::string, string_type>{};
+  (void)index_regression_tester<ip, ip_type>{};
+  (void)index_regression_tester<subnet, subnet_type>{};
+  (void)index_regression_tester<enumeration, enumeration_type>{};
+  (void)index_regression_tester<node_list, list_type>{};
+  (void)index_regression_tester<map_dummy, map_type>{};
+  (void)index_regression_tester<node_record, record_type>{};
+  (void)index_regression_tester<blob, blob_type>{};
 }
 } // namespace
 
@@ -171,29 +127,24 @@ auto node_base::affects_signature() const -> bool {
   TENZIR_UNREACHABLE();
 }
 
-auto node_base::clear() -> void {
-  state_ = state::dead;
-}
 auto node_record::try_field(std::string_view name) -> node_field* {
   auto [it, inserted] = lookup_.try_emplace(name, data_.size());
-  node_field* res;
   if (not inserted) {
-    res = &data_[it->second].value;
-  } else {
-    res = &data_.emplace_back(it->first).value;
+    return &data_[it->second].value;
   }
-  return res;
+  TENZIR_ASSERT(data_.size() <= 20'000, "Upper limit on record size reached.");
+  return &data_.emplace_back(it->first).value;
 }
 
-auto node_record::reserve( size_t N ) -> void {
+auto node_record::reserve(size_t N) -> void {
   lookup_.reserve(N);
   data_.reserve(N);
 }
 
 auto node_record::field(std::string_view name) -> node_field* {
-  state_ = state::alive;
+  mark_this_alive();
   auto* f = try_field(name);
-  f->state_ = state::alive;
+  f->mark_this_alive();
   return f;
 }
 
@@ -220,17 +171,32 @@ auto node_record::at(std::string_view key) -> node_field* {
   return nullptr;
 }
 
-auto node_record::commit_to(record_ref r) -> void {
-  mark_this_dead();
+auto node_record::commit_to(record_ref r, bool mark_dead) -> void {
+  if (mark_dead) {
+    mark_this_dead();
+  }
   for (auto& [k, v] : data_) {
     if (v.is_alive()) {
-      v.commit_to(r.field(k));
+      v.commit_to(r.field(k), mark_dead);
     }
   }
 }
 
+auto node_record::commit_to(tenzir::record& r, bool mark_dead) -> void {
+  if (mark_dead) {
+    mark_this_dead();
+  }
+  for (auto& [k, v] : data_) {
+    if (not v.is_alive()) {
+      continue;
+    }
+    const auto [it, success] = r.try_emplace(k);
+    v.commit_to(it->second, mark_dead);
+  }
+}
+
 auto node_record::clear() -> void {
-  node_base::clear();
+  node_base::mark_this_dead();
   for (auto& [k, v] : data_) {
     v.clear();
   }
@@ -245,52 +211,47 @@ auto node_record::reseed(const tenzir::record_type& type) -> void {
   }
 }
 
-auto node_record::append_to_signature(signature_type& sig,
-                                      const tenzir::record_type* seed) -> void {
-  constexpr static std::byte record_start{0b10101010};
-  sig.push_back(record_start);
+auto node_field::null() -> void {
+  mark_this_alive();
+  is_raw_ = false;
+  data_ = caf::none;
+}
 
-  // if we have a seed, we need too ensure that all fields exist first
-  if (seed) {
-    for (const auto& [k, v] : seed->fields()) {
-      try_field(k)->mark_this_relevant();
-    }
-  }
-  // we are intentionally traversing `lookup_` here, because that is sorted by
-  // name. this ensures that the signature computation will be the same
-  for (const auto& [k, index] : lookup_) {
-    if (data_[index].value.affects_signature()) {
-      tenzir::type field_seed;
-      if (seed) { // TODO is this a good idea????? I dont see any other way to
-                  // find the type for a field with a given name
-                  // a non-generator based API to get these would be ideal, so
-                  // we dont have to iterate for every key
-        for (auto [seed_key, seed_type] : seed->fields()) {
-          if (seed_key == k) {
-            field_seed = std::move(seed_type);
-            break;
-          }
-        }
+auto node_field::data(tenzir::data d) -> void {
+  mark_this_alive();
+  is_raw_ = false;
+  const auto visitor = detail::overload{
+    [this](non_structured_data_type auto& x) {
+      data(std::move(x));
+    },
+    [this](tenzir::list& x) {
+      auto* l = list();
+      for (auto& e : x) {
+        l->data(std::move(e));
       }
-      const auto key_bytes = as_bytes(k);
-      sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
-      data_[index].value.append_to_signature(sig, seed ? &field_seed : nullptr);
-    }
-  }
+    },
+    [this](tenzir::record& x) {
+      auto* r = record();
+      for (auto& [k, v] : x) {
+        r->field(k)->data(std::move(v));
+      }
+    },
+    [](auto&) {
+      TENZIR_UNREACHABLE();
+    },
+  };
+
+  return caf::visit(visitor, d);
 }
 
-template <non_structured_data_type T>
-auto node_field::data(T data) -> void {
-  state_ = state::alive;
-  data_ = data;
+auto node_field::data_unparsed(std::string text) -> void {
+  mark_this_alive();
+  is_raw_ = true;
+  data_.emplace<std::string>(std::move(text));
 }
-
-#define INSTANTIATE_field_data(T) template auto node_field::data(T)->void;
-
-FOR_EACH(INSTANTIATE_field_data, NON_STRUCTURED_TYPES)
 
 auto node_field::record() -> node_record* {
-  state_ = state::alive;
+  mark_this_alive();
   if (auto* p = get_if<node_record>()) {
     return p;
   }
@@ -298,7 +259,7 @@ auto node_field::record() -> node_record* {
 }
 
 auto node_field::list() -> node_list* {
-  state_ = state::alive;
+  mark_this_alive();
   if (auto* p = get_if<node_list>()) {
     return p;
   }
@@ -310,7 +271,7 @@ auto node_field::reseed(const tenzir::type& seed) -> void {
     state_ = state::sentinel;
   }
   const auto visitor = detail::overload{
-    [&]<basic_type T>(const T&) {
+    [&]<non_structured_data_type T>(const T&) {
       data(T::construct());
     },
     [&](const enumeration_type&) {
@@ -331,64 +292,61 @@ auto node_field::reseed(const tenzir::type& seed) -> void {
   caf::visit(visitor, seed);
 }
 
-auto node_field::commit_to(builder_ref r) -> void {
-  mark_this_dead();
+auto node_field::commit_to(builder_ref r, bool mark_dead) -> void {
+  if (mark_dead) {
+    mark_this_dead();
+  }
   const auto visitor = detail::overload{
-    [&r](node_list& v) {
+    [&r, mark_dead](node_list& v) {
       if (v.is_alive()) {
-        v.commit_to(r.list());
+        v.commit_to(r.list(), mark_dead);
       }
     },
-    [&r](node_record& v) {
+    [&r, mark_dead](node_record& v) {
       if (v.is_alive()) {
-        v.commit_to(r.record());
+        v.commit_to(r.record(), mark_dead);
       }
     },
-    [](std::monostate) {
-      TENZIR_WARN("unfinished field in record builder");
-    },
-    [](tenzir::pattern) {
-      TENZIR_UNIMPLEMENTED();
-    },
-    [&r](auto& v) {
+    [&r]<non_structured_data_type T>(T& v) {
       r.data(v);
+    },
+    [](auto&) {
+      TENZIR_UNREACHABLE();
     },
   };
   std::visit(visitor, data_);
 }
 
-auto node_field::append_to_signature(signature_type& sig,
-                                     const tenzir::type* seed) -> void {
-  // FIXME handle conflict between seed and held type here.
+auto node_field::commit_to(tenzir::data& r, bool mark_dead) -> void {
+  if (mark_dead) {
+    mark_this_dead();
+  }
   const auto visitor = detail::overload{
-    [&sig, seed](node_list& v) {
-      auto* ls = caf::get_if<list_type>(seed);
-      if (v.affects_signature() or ls) {
-        v.append_to_signature(sig, ls);
+    [&r, mark_dead](node_list& v) {
+      if (v.is_alive()) {
+        r = tenzir::list{};
+        v.commit_to(caf::get<tenzir::list>(r), mark_dead);
       }
     },
-    [&sig, seed](node_record& v) {
-      auto* rs = caf::get_if<record_type>(seed);
-      if (v.affects_signature() or rs) {
-        v.append_to_signature(sig, rs);
+    [&r, mark_dead](node_record& v) {
+      if (v.is_alive()) {
+        r = tenzir::record{};
+        v.commit_to(caf::get<tenzir::record>(r), mark_dead);
       }
     },
-    [](std::monostate) {
-      TENZIR_WARN("unfinished field in record builder");
+    [&r]<non_structured_data_type T>(T& v) {
+      // TODO consider moving string/blob/...
+      r = v;
     },
-    [](tenzir::pattern) {
-      TENZIR_UNIMPLEMENTED();
-    },
-    [&sig, seed]<typename T>(const T&) {
-      using Type = data_to_type_t<T>;
-      sig.push_back(static_cast<std::byte>(Type::type_index));
+    [](auto&) {
+      TENZIR_UNREACHABLE();
     },
   };
   std::visit(visitor, data_);
 }
 
 auto node_field::clear() -> void {
-  node_base::clear();
+  node_base::mark_this_dead();
   const auto visitor = detail::overload{
     [](node_list& v) {
       v.clear();
@@ -410,29 +368,52 @@ auto node_list::find_free() -> node_field* {
   return nullptr;
 }
 
-auto node_list::reserve( size_t N ) -> void {
+auto node_list::reserve(size_t N) -> void {
   data_.reserve(N);
 }
 
+auto node_list::data(tenzir::data d) -> void {
+  mark_this_alive();
+  const auto visitor = detail::overload{
+    [this](non_structured_data_type auto& x) {
+      data(std::move(x));
+    },
+    [this](tenzir::list& x) {
+      auto* l = list();
+      for (auto& e : x) {
+        l->data(std::move(e));
+      }
+    },
+    [this](tenzir::record& x) {
+      auto* r = record();
+      for (auto& [k, v] : x) {
+        r->field(k)->data(std::move(v));
+      }
+    },
+    [](auto&) {
+      TENZIR_UNREACHABLE();
+    },
+  };
 
-template <non_structured_data_type T>
-auto node_list::data(T data) -> void {
-  state_ = state::alive;
+  return caf::visit(visitor, d);
+}
+
+auto node_list::data_unparsed(std::string text) -> void {
+  mark_this_alive();
   if (auto* free = find_free()) {
-    free->data_ = std::move(data);
-    update_type_index(type_index_, free->current_index());
+    free->data_unparsed(text);
   } else {
-    data_.emplace_back(data);
-    update_type_index(type_index_, data_.back().current_index());
+    TENZIR_ASSERT(data_.size() <= 20'000, "Upper limit on list size reached.");
+    data_.emplace_back().data_unparsed(text);
   }
 }
 
-#define INSTANTIATE_list_data(T) template auto node_list::data(T)->void;
-
-FOR_EACH(INSTANTIATE_list_data, NON_STRUCTURED_TYPES)
+auto node_list::null() -> void {
+  return data(caf::none);
+}
 
 auto node_list::record() -> node_record* {
-  state_ = state::alive;
+  mark_this_alive();
   update_type_index(type_index_, type_index_record);
   if (auto* free = find_free()) {
     if (auto* r = free->get_if<node_record>()) {
@@ -441,13 +422,14 @@ auto node_list::record() -> node_record* {
       return &free->data_.emplace<node_record>();
     }
   } else {
+    TENZIR_ASSERT(data_.size() <= 20'000, "Upper limit on list size reached.");
     return data_.emplace_back().record();
   }
 }
 
 auto node_list::list() -> node_list* {
-  state_ = state::alive;
-  update_type_index(type_index_, type_index_record);
+  mark_this_alive();
+  update_type_index(type_index_, type_index_list);
   if (auto* free = find_free()) {
     if (auto* r = free->get_if<node_list>()) {
       return r;
@@ -455,6 +437,7 @@ auto node_list::list() -> node_list* {
       return &free->data_.emplace<node_list>();
     }
   } else {
+    TENZIR_ASSERT(data_.size() <= 20'000, "Upper limit on list size reached.");
     return data_.emplace_back().list();
   }
 }
@@ -489,32 +472,34 @@ auto node_list::reseed(const tenzir::list_type& seed) -> void {
   caf::visit(visitor, value_type);
 }
 
-auto node_list::commit_to(builder_ref r) -> void {
-  mark_this_dead();
+auto node_list::commit_to(builder_ref r, bool mark_dead) -> void {
+  if (mark_dead) {
+    mark_this_dead();
+  }
   for (auto& v : data_) {
     if (v.is_alive()) {
-      v.commit_to(r);
+      v.commit_to(r, mark_dead);
+    } else {
+      break;
+    }
+  }
+}
+auto node_list::commit_to(tenzir::list& r, bool mark_dead) -> void {
+  if (mark_dead) {
+    mark_this_dead();
+  }
+  for (auto& v : data_) {
+    if (v.is_alive()) {
+      auto& d = r.emplace_back();
+      v.commit_to(d, mark_dead);
     } else {
       break;
     }
   }
 }
 
-auto node_list::append_to_signature(signature_type& sig,
-                                    const tenzir::list_type* seed) -> void {
-  constexpr static std::byte list_start{0b01010101};
-  sig.push_back(list_start);
-  if (data_.empty() and not seed) {
-    return;
-  }
-  if (seed) {
-    reseed(*seed);
-  }
-  sig.push_back(static_cast<std::byte>(type_index_));
-}
-
 auto node_list::clear() -> void {
-  node_base::clear();
+  node_base::mark_this_dead();
   type_index_ = type_index_empty;
   for (auto& v : data_) {
     v.clear();
