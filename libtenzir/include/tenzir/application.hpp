@@ -11,16 +11,10 @@
 #include "tenzir/command.hpp"
 
 #include <memory>
-#include <string>
 #include <string_view>
 #include <utility>
 
 namespace tenzir {
-
-/// Creates the import command in the command tree.
-/// @note This function is publicly exposed for use in plugins that must provide
-/// a custom import command.
-std::unique_ptr<command> make_import_command();
 
 /// Creates the applications command tree based on a single root command.
 /// @returns the root command.

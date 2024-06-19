@@ -28,9 +28,6 @@
 #include "tenzir/detail/fill_status_map.hpp"
 #include "tenzir/detail/narrow.hpp"
 #include "tenzir/detail/notifying_stream_manager.hpp"
-#include "tenzir/detail/shutdown_stream_stage.hpp"
-#include "tenzir/detail/spawn_container_source.hpp"
-#include "tenzir/detail/tracepoint.hpp"
 #include "tenzir/detail/weak_run_delayed.hpp"
 #include "tenzir/error.hpp"
 #include "tenzir/fbs/index.hpp"
@@ -602,9 +599,10 @@ caf::error index_state::load_from_disk() {
       synopses->emplace(partition_uuid, std::move(ps));
       return caf::none;
     }();
-    if (error)
-      TENZIR_ERROR("{} failed to load partition {}: {}", *self, partition_uuid,
-                   error);
+    if (error) {
+      TENZIR_VERBOSE("{} failed to load partition {}: {}", *self,
+                     partition_uuid, error);
+    }
   }
   //  Recommend the user to run 'tenzir-ctl rebuild' if any partition syopses
   //  are outdated. We need to nudge them a bit so we can drop support for older
@@ -732,12 +730,6 @@ index_state::create_active_partition(const type& schema) {
   stage->out().set_filter(active_partition->second.stream_slot, schema);
   active_partition->second.capacity = partition_capacity;
   active_partition->second.id = id;
-  self->request(catalog, caf::infinite, atom::put_v, schema)
-    .then([]() {},
-          [this](const caf::error& error) {
-            TENZIR_WARN("{} failed to register type with catalog: {}", *self,
-                        error);
-          });
   detail::weak_run_delayed(self, active_partition_timeout, [schema, id, this] {
     const auto it = active_partitions.find(schema);
     if (it == active_partitions.end() or it->second.id != id) {
@@ -774,9 +766,10 @@ void index_state::decommission_active_partition(
   const auto id = active_partition->second.id;
   const auto actor = std::exchange(active_partition->second.actor, {});
   const auto type = active_partition->first;
+  auto stream_slot = active_partition->second.stream_slot;
   // Send buffered batches and remove active partition from the stream.
   stage->out().fan_out_flush();
-  stage->out().close(active_partition->second.stream_slot);
+  stage->out().close(stream_slot);
   stage->out().force_emit_batches();
   // Move the active partition to the list of unpersisted partitions.
   TENZIR_ASSERT_EXPENSIVE(!unpersisted.contains(id));
@@ -808,7 +801,8 @@ void index_state::decommission_active_partition(
         // so we make a copy for the listeners.
         // TODO: We should skip this continuation if we're currently shutting
         // down.
-        self->request(catalog, caf::infinite, atom::merge_v, id, ps)
+        auto apsv = std::vector<partition_synopsis_pair>{{id, ps}};
+        self->request(catalog, caf::infinite, atom::merge_v, std::move(apsv))
           .then(
             [=, this](atom::ok) {
               TENZIR_VERBOSE("{} inserted partition {} {} to the catalog",
@@ -817,6 +811,7 @@ void index_state::decommission_active_partition(
                 self->send(listener, atom::update_v,
                            partition_synopsis_pair{id, ps});
               unpersisted.erase(id);
+              self->erase_stream_manager(stream_slot);
               persisted_partitions.emplace(id);
               self->send_exit(actor, caf::exit_reason::normal);
               if (completion)
@@ -829,6 +824,7 @@ void index_state::decommission_active_partition(
                            "queries: {}",
                            *self, schema, id, err);
               unpersisted.erase(id);
+              self->erase_stream_manager(stream_slot);
               self->send_exit(actor, err);
               if (completion)
                 completion(err);
@@ -840,6 +836,7 @@ void index_state::decommission_active_partition(
                      "memory to preserve process integrity: {}",
                      *self, schema, id, err);
         unpersisted.erase(id);
+        self->erase_stream_manager(stream_slot);
         self->send_exit(actor, err);
         if (completion)
           completion(err);
@@ -1567,10 +1564,6 @@ index(index_actor::stateful_pointer<index_state> self,
            tenzir::expression& expr) -> caf::result<catalog_lookup_result> {
       auto query_context = query_context::make_extract("index", self, expr);
       query_context.id = tenzir::uuid::random();
-      auto type_set = tenzir::type_set{};
-      for (const auto& [type, _] : self->state.active_partitions) {
-        type_set.insert(type);
-      }
       return self->delegate(self->state.catalog, atom::candidates_v,
                             std::move(query_context));
     },

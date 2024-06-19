@@ -872,11 +872,9 @@ auto resolve_operand(const table_slice& slice, const operand& op)
     }
     inferred_type = *tmp_inferred_type;
     if (not inferred_type) {
-      inferred_type = type{string_type{}};
-      // Tenzir has no N/A type equivalent for Arrow, so we just use a string
-      // type here.
+      inferred_type = type{null_type{}};
       auto builder
-        = string_type::make_arrow_builder(arrow::default_memory_pool());
+        = null_type::make_arrow_builder(arrow::default_memory_pool());
       const auto append_result = builder->AppendNulls(batch->num_rows());
       TENZIR_ASSERT(append_result.ok(), append_result.ToString().c_str());
       array = builder->Finish().ValueOrDie();
@@ -1128,8 +1126,9 @@ auto make_rename_transformation(std::string new_name)
 } // namespace
 
 auto flatten(table_slice slice, std::string_view separator) -> flatten_result {
-  if (slice.rows() == 0)
+  if (slice.rows() == 0 or slice.columns() == 0) {
     return {std::move(slice), {}};
+  }
   // We cannot use arrow::StructArray::Flatten here because that does not
   // work recursively, see apache/arrow#20683. Hence, we roll our own version
   // here.

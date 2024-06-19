@@ -8,13 +8,9 @@
 
 #include "tenzir/application.hpp"
 #include "tenzir/concept/convertible/to.hpp"
-#include "tenzir/data.hpp"
 #include "tenzir/default_configuration.hpp"
 #include "tenzir/detail/settings.hpp"
 #include "tenzir/detail/signal_handlers.hpp"
-#include "tenzir/factory.hpp"
-#include "tenzir/format/reader_factory.hpp" // IWYU pragma: keep
-#include "tenzir/format/writer_factory.hpp" // IWYU pragma: keep
 #include "tenzir/logger.hpp"
 #include "tenzir/module.hpp"
 #include "tenzir/modules.hpp"
@@ -34,20 +30,25 @@
 #include <thread>
 #include <unordered_map>
 
-int main(int argc, char** argv) {
+auto main(int argc, char** argv) -> int {
   using namespace tenzir;
   // Set a signal handler for fatal conditions. Prints a backtrace if support
   // for that is enabled.
-  std::signal(SIGSEGV, fatal_handler);
-  std::signal(SIGABRT, fatal_handler);
+  if (SIG_ERR == std::signal(SIGSEGV, fatal_handler)) [[unlikely]] {
+    fmt::print(stderr, "failed to set signal handler for SIGSEGV\n");
+    return EXIT_FAILURE;
+  }
+  if (SIG_ERR == std::signal(SIGABRT, fatal_handler)) [[unlikely]] {
+    fmt::print(stderr, "failed to set signal handler for SIGABRT\n");
+    return EXIT_FAILURE;
+  }
   // Mask SIGINT and SIGTERM so we can handle those in a dedicated thread.
   auto sigset = termsigset();
   pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
   // Set up our configuration, e.g., load of YAML config file(s).
   default_configuration cfg;
   if (auto err = cfg.parse(argc, argv)) {
-    std::cerr << "failed to parse configuration: " << to_string(err)
-              << std::endl;
+    fmt::print(stderr, "failed to parse configuration: {}\n", err);
     return EXIT_FAILURE;
   }
   auto loaded_plugin_paths = plugins::load({TENZIR_BUNDLED_PLUGINS}, cfg);
@@ -55,9 +56,6 @@ int main(int argc, char** argv) {
     fmt::print(stderr, "{}\n", loaded_plugin_paths.error());
     return EXIT_FAILURE;
   }
-  // Initialize factories.
-  factory<format::reader>::initialize();
-  factory<format::writer>::initialize();
   // Application setup.
   auto [root, root_factory] = make_application(argv[0]);
   if (!root)
@@ -93,10 +91,10 @@ int main(int argc, char** argv) {
   if (!cfg.config_file_path.empty())
     cfg.config_files.emplace_back(std::move(cfg.config_file_path));
   for (const auto& file : loaded_config_files())
-    TENZIR_INFO("loaded configuration file: {}", file);
+    TENZIR_VERBOSE("loaded configuration file: {}", file);
   // Print the plugins that were loaded, and errors that occured during loading.
   for (const auto& file : *loaded_plugin_paths)
-    TENZIR_VERBOSE("loaded plugin: {}", file);
+    TENZIR_DEBUG("loaded plugin: {}", file);
   // Make sure to deinitialize all plugins at the end.
   auto plugin_guard = caf::detail::make_scope_guard([]() noexcept {
     // Ideally, we would not have this deinitialize function at all and could

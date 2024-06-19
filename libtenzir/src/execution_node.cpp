@@ -114,57 +114,52 @@ template <class Input, class Output>
 struct exec_node_state;
 
 template <class Input, class Output>
-class exec_node_diagnostic_handler final : public diagnostic_handler {
-public:
+struct exec_node_diagnostic_handler final : public diagnostic_handler {
   exec_node_diagnostic_handler(
     exec_node_actor::stateful_pointer<exec_node_state<Input, Output>> self,
-    receiver_actor<diagnostic> diagnostic_handler)
-    : self_{self}, diagnostic_handler_{std::move(diagnostic_handler)} {
+    receiver_actor<diagnostic> handle)
+    : self{self}, handle{std::move(handle)} {
   }
 
   void emit(diagnostic diag) override {
-    TENZIR_TRACE("{} {} emits diagnostic: {:?}", *self_,
-                 self_->state.op->name(), diag);
+    TENZIR_TRACE("{} {} emits diagnostic: {:?}", *self, self->state.op->name(),
+                 diag);
     if (diag.severity == severity::error) {
-      self_->send(diagnostic_handler_, diag);
-      self_->quit(std::move(diag).to_error());
-      return;
+      throw std::move(diag);
     }
-    self_->send(diagnostic_handler_, std::move(diag));
+    self->send(handle, std::move(diag));
   }
 
-private:
-  exec_node_actor::stateful_pointer<exec_node_state<Input, Output>> self_ = {};
-  receiver_actor<diagnostic> diagnostic_handler_ = {};
+  exec_node_actor::stateful_pointer<exec_node_state<Input, Output>> self = {};
+  receiver_actor<diagnostic> handle = {};
 };
 
 template <class Input, class Output>
-class exec_node_control_plane final : public operator_control_plane {
-public:
+struct exec_node_control_plane final : public operator_control_plane {
   exec_node_control_plane(
     exec_node_actor::stateful_pointer<exec_node_state<Input, Output>> self,
     receiver_actor<diagnostic> diagnostic_handler, bool has_terminal)
-    : state_{self->state},
-      diagnostic_handler_{
+    : state{self->state},
+      diagnostic_handler{
         std::make_unique<exec_node_diagnostic_handler<Input, Output>>(
           self, std::move(diagnostic_handler))},
       has_terminal_{has_terminal} {
   }
 
   auto self() noexcept -> exec_node_actor::base& override {
-    return *state_.self;
+    return *state.self;
   }
 
   auto node() noexcept -> node_actor override {
-    return state_.weak_node.lock();
+    return state.weak_node.lock();
   }
 
   auto diagnostics() noexcept -> diagnostic_handler& override {
-    return *diagnostic_handler_;
+    return *diagnostic_handler;
   }
 
   auto no_location_overrides() const noexcept -> bool override {
-    return caf::get_or(content(state_.self->config()),
+    return caf::get_or(content(state.self->config()),
                        "tenzir.no-location-overrides", false);
   }
 
@@ -173,15 +168,14 @@ public:
   }
 
   auto set_waiting(bool value) noexcept -> void override {
-    state_.waiting = value;
-    if (not state_.waiting) {
-      state_.schedule_run(false);
+    state.waiting = value;
+    if (not state.waiting) {
+      state.schedule_run(false);
     }
   }
 
-private:
-  exec_node_state<Input, Output>& state_;
-  std::unique_ptr<exec_node_diagnostic_handler<Input, Output>> diagnostic_handler_
+  exec_node_state<Input, Output>& state;
+  std::unique_ptr<exec_node_diagnostic_handler<Input, Output>> diagnostic_handler
     = {};
   bool has_terminal_;
 };
@@ -242,8 +236,9 @@ struct exec_node_state {
   caf::typed_response_promise<void> start_rp = {};
 
   /// Exponential backoff for scheduling.
-  static constexpr duration min_backoff = std::chrono::milliseconds{10};
-  static constexpr duration max_backoff = std::chrono::milliseconds{1000};
+  static constexpr duration min_backoff = std::chrono::milliseconds{250};
+  static constexpr duration max_backoff = std::chrono::minutes{1};
+  static constexpr double backoff_rate = 2.0;
   duration backoff = duration::zero();
   caf::disposable backoff_disposable = {};
 
@@ -272,6 +267,9 @@ struct exec_node_state {
       demand->rp.deliver();
     }
     if (start_rp.pending()) {
+      // TODO: This should probably never happen, as it means that we do not
+      // deliver a diagnostic.
+      TENZIR_WARN("reached pending `start_rp` in exec node destructor");
       start_rp.deliver(ec::silent);
     }
   }
@@ -311,7 +309,7 @@ struct exec_node_state {
         TENZIR_DEBUG("{} {} got exit message from the next execution node or "
                      "its executor with address {}: {}",
                      *self, op->name(), msg.source, msg.reason);
-        self->quit(msg.reason);
+        on_error(msg.reason);
       });
     } else {
       // The previous exec-node must be set when the operator is not a source.
@@ -339,14 +337,14 @@ struct exec_node_state {
           TENZIR_DEBUG("{} {} got exit message from the next execution node or "
                        "its executor with address {}: {}",
                        *self, op->name(), msg.source, msg.reason);
-          self->quit(msg.reason);
+          on_error(msg.reason);
           return;
         }
         TENZIR_DEBUG("{} {} got exit message from previous execution node with "
                      "address {}: {}",
                      *self, op->name(), msg.source, msg.reason);
         if (msg.reason and msg.reason != caf::exit_reason::unreachable) {
-          self->quit(msg.reason);
+          on_error(msg.reason);
           return;
         }
         previous = nullptr;
@@ -415,8 +413,7 @@ struct exec_node_state {
               = make_timer_guard(metrics.time_scheduled, metrics.time_starting);
             TENZIR_DEBUG("{} {} forwards error during startup: {}", *self,
                          op->name(), error);
-            start_rp.deliver(
-              add_context(error, "{} {} failed to start", *self, op->name()));
+            start_rp.deliver(error);
           });
       return start_rp;
     }
@@ -580,8 +577,9 @@ struct exec_node_state {
     } else if (backoff == duration::zero()) {
       backoff = min_backoff;
     } else {
-      backoff = std::min(std::chrono::duration_cast<duration>(1.25 * backoff),
-                         max_backoff);
+      backoff
+        = std::min(std::chrono::duration_cast<duration>(backoff_rate * backoff),
+                   max_backoff);
     }
     TENZIR_TRACE("{} {} schedules run with a delay of {}", *self, op->name(),
                  data{backoff});
@@ -651,21 +649,25 @@ struct exec_node_state {
     advance_generator();
     // We can continue execution under the following circumstances:
     // 1. The operator's generator is not yet completed.
-    // 2. The operator has one of the three following reasons to do work:
+    // 2. The operator did not signal that we're supposed to wait.
+    // 3. The operator has one of the four following reasons to do work:
     //   a. The upstream operator has completed.
     //   b. The operator has downstream demand and can produce output
     //      independently from receiving input.
     //   c. The operator has input it can consume.
     //   d. The operator is a command, i.e., has both a source and a sink.
+    const auto has_demand
+      = demand.has_value() or std::is_same_v<Output, std::monostate>;
     const auto should_continue
       = instance->it != instance->gen.end()                         // (1)
-        and (not previous                                           // (2a)
-             or (demand.has_value() and op->input_independent())    // (2b)
-             or not inbound_buffer.empty()                          // (2c)
-             or detail::are_same_v<std::monostate, Input, Output>); // (2d)
+        and not waiting                                             // (2)
+        and (not previous                                           // (3a)
+             or (has_demand and op->input_independent())            // (3b)
+             or not inbound_buffer.empty()                          // (3c)
+             or detail::are_same_v<std::monostate, Input, Output>); // (3d)
     if (should_continue) {
       schedule_run(false);
-    } else if (demand.has_value() or std::is_same_v<Output, std::monostate>) {
+    } else if (not waiting and has_demand) {
       // If we shouldn't continue, but there is an upstream demand, then we may
       // be in a situation where the operator has internally buffered events and
       // needs to be polled until some operator-internal timeout expires before
@@ -713,6 +715,15 @@ struct exec_node_state {
     schedule_run(false);
     return {};
   }
+
+  void on_error(caf::error error) {
+    if (start_rp.pending()) {
+      start_rp.deliver(std::move(error));
+      self->quit(ec::silent);
+      return;
+    }
+    self->quit(std::move(error));
+  }
 };
 
 template <class Input, class Output>
@@ -745,7 +756,7 @@ auto exec_node(
     self, std::move(diagnostic_handler), has_terminal);
   // The node actor must be set when the operator is not a source.
   if (self->state.op->location() == operator_location::remote and not node) {
-    self->quit(caf::make_error(
+    self->state.on_error(caf::make_error(
       ec::logic_error,
       fmt::format("{} runs a remote operator and must have a node", *self)));
     return exec_node_actor::behavior_type::make_empty_behavior();
@@ -753,20 +764,26 @@ auto exec_node(
   self->state.weak_node = node;
   self->set_exception_handler(
     [self](std::exception_ptr exception) -> caf::error {
-      try {
-        std::rethrow_exception(exception);
-      } catch (diagnostic diag) {
-        self->state.ctrl->diagnostics().emit(std::move(diag));
-        return {};
-      } catch (const std::exception& err) {
-        diagnostic::error("{}", err.what())
-          .note("unhandled exception in {} {}", *self, self->state.op->name())
-          .emit(self->state.ctrl->diagnostics());
-        return {};
+      auto error = std::invoke([&] {
+        try {
+          std::rethrow_exception(exception);
+        } catch (diagnostic diag) {
+          return std::move(diag).to_error();
+        } catch (const std::exception& err) {
+          return diagnostic::error("{}", err.what())
+            .note("unhandled exception in {} {}", *self, self->state.op->name())
+            .to_error();
+        } catch (...) {
+          return diagnostic::error("unhandled exception in {} {}", *self,
+                                   self->state.op->name())
+            .to_error();
+        }
+      });
+      if (self->state.start_rp.pending()) {
+        self->state.start_rp.deliver(std::move(error));
+        return ec::silent;
       }
-      return diagnostic::error("unhandled exception in {} {}", *self,
-                               self->state.op->name())
-        .to_error();
+      return error;
     });
   return {
     [self](atom::internal, atom::run) -> caf::result<void> {
@@ -837,7 +854,7 @@ auto exec_node(
 
 auto spawn_exec_node(caf::scheduled_actor* self, operator_ptr op,
                      operator_type input_type, node_actor node,
-                     receiver_actor<diagnostic> diagnostics_handler,
+                     receiver_actor<diagnostic> diagnostic_handler,
                      receiver_actor<metric> metrics_handler, int index,
                      bool has_terminal)
   -> caf::expected<std::pair<exec_node_actor, operator_type>> {
@@ -845,7 +862,7 @@ auto spawn_exec_node(caf::scheduled_actor* self, operator_ptr op,
   TENZIR_ASSERT(op != nullptr);
   TENZIR_ASSERT(node != nullptr
                 or not(op->location() == operator_location::remote));
-  TENZIR_ASSERT(diagnostics_handler != nullptr);
+  TENZIR_ASSERT(diagnostic_handler != nullptr);
   auto output_type = op->infer_type(input_type);
   if (not output_type) {
     return caf::make_error(ec::logic_error,
@@ -861,7 +878,7 @@ auto spawn_exec_node(caf::scheduled_actor* self, operator_ptr op,
         = std::conditional_t<std::is_void_v<Output>, std::monostate, Output>;
       auto result = self->spawn<SpawnOptions>(
         exec_node<input_type, output_type>, std::move(op), std::move(node),
-        std::move(diagnostics_handler), std::move(metrics_handler), index,
+        std::move(diagnostic_handler), std::move(metrics_handler), index,
         has_terminal);
       return result;
     };

@@ -147,7 +147,7 @@ RUN apt-get update && \
     apt-get -y --no-install-recommends install \
       ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb && \
     apt-get update && \
-    apt-get -y --no-install-recommends install libarrow1600 libparquet1600 && \
+    apt-get -y --no-install-recommends install libarrow1500=15.0.2-1 libparquet1500=15.0.2-1 && \
     apt-get -y --no-install-recommends install /root/fluent-bit_*.deb && \
     rm /root/fluent-bit_*.deb && \
     rm -rf /var/lib/apt/lists/* && \
@@ -178,6 +178,15 @@ FROM development AS plugins-source
 WORKDIR /tmp/tenzir
 COPY contrib/tenzir-plugins ./contrib/tenzir-plugins
 
+FROM plugins-source AS azure-log-analytics-plugin
+
+RUN cmake -S contrib/tenzir-plugins/azure-log-analytics -B build-azure-log-analytics -G Ninja \
+      -D CMAKE_INSTALL_PREFIX:STRING="$PREFIX" && \
+      cmake --build build-azure-log-analytics --parallel && \
+      cmake --build build-azure-log-analytics --target integration && \
+      DESTDIR=/plugin/azure-log-analytics cmake --install build-azure-log-analytics --strip --component Runtime && \
+      rm -rf build-build-azure-log-analytics
+
 FROM plugins-source AS compaction-plugin
 
 RUN cmake -S contrib/tenzir-plugins/compaction -B build-compaction -G Ninja \
@@ -195,15 +204,6 @@ RUN cmake -S contrib/tenzir-plugins/context -B build-context -G Ninja \
       cmake --build build-context --target integration && \
       DESTDIR=/plugin/context cmake --install build-context --strip --component Runtime && \
       rm -rf build-context
-
-FROM plugins-source AS matcher-plugin
-
-RUN cmake -S contrib/tenzir-plugins/matcher -B build-matcher -G Ninja \
-      -D CMAKE_INSTALL_PREFIX:STRING="$PREFIX" && \
-      cmake --build build-matcher --parallel && \
-      cmake --build build-matcher --target integration && \
-      DESTDIR=/plugin/matcher cmake --install build-matcher --strip --component Runtime && \
-      rm -rf build-matcher
 
 FROM plugins-source AS pipeline-manager-plugin
 
@@ -236,9 +236,9 @@ RUN cmake -S contrib/tenzir-plugins/vast -B build-vast -G Ninja \
 
 FROM tenzir-de AS tenzir-ce
 
+COPY --from=azure-log-analytics-plugin --chown=tenzir:tenzir /plugin/azure-log-analytics /
 COPY --from=compaction-plugin --chown=tenzir:tenzir /plugin/compaction /
 COPY --from=context-plugin --chown=tenzir:tenzir /plugin/context /
-COPY --from=matcher-plugin --chown=tenzir:tenzir /plugin/matcher /
 COPY --from=pipeline-manager-plugin --chown=tenzir:tenzir /plugin/pipeline-manager /
 COPY --from=platform-plugin --chown=tenzir:tenzir /plugin/platform /
 COPY --from=vast-plugin --chown=tenzir:tenzir /plugin/vast /
@@ -251,23 +251,14 @@ ENTRYPOINT ["tenzir-node"]
 
 # -- tenzir-demo --------------------------------------------------------------
 
-FROM tenzir-ce AS tenzir-demo
+FROM tenzir-node-ce AS tenzir-demo
 
-USER root
-RUN apt-get update && \
-    apt-get -y --no-install-recommends install jq lsof && \
-    rm -rf /var/lib/apt/lists/*
-
-USER tenzir:tenzir
-COPY demo-node /demo-node
-COPY --from=tenzir-ce --chown=tenzir:tenzir \
-       /var/cache/tenzir \
-       /var/lib/tenzir/ \
-       /var/log/tenzir
-ENV TENZIR_AUTOMATIC_REBUILD=0
-RUN /demo-node/setup.bash
-
-ENTRYPOINT ["tenzir-node"]
+ENV TENZIR_PIPELINES__M57_SURICATA__NAME='M57 Suricata' \
+    TENZIR_PIPELINES__M57_SURICATA__DEFINITION='from https://storage.googleapis.com/tenzir-datasets/M57/suricata.json.zst read suricata --no-infer | where #schema != "suricata.stats" | import' \
+    TENZIR_PIPELINES__M57_SURICATA__LABELS='suricata' \
+    TENZIR_PIPELINES__M57_ZEEK__NAME='M57 Zeek' \
+    TENZIR_PIPELINES__M57_ZEEK__DEFINITION='from https://storage.googleapis.com/tenzir-datasets/M57/zeek-all.log.zst read zeek-tsv | import' \
+    TENZIR_PIPELINES__M57_ZEEK__LABELS='zeek'
 
 # -- tenzir-node -----------------------------------------------------------------
 

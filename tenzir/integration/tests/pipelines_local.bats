@@ -176,7 +176,7 @@ setup() {
 }
 # bats test_tags=pipelines
 @test "Empty Record in Pipeline" {
-  check tenzir "from ${INPUTSDIR}/json/empty-record.json read json| write json"
+  check tenzir "from ${INPUTSDIR}/json/empty-record.json read json | write json"
   check tenzir "from ${INPUTSDIR}/json/empty-record.json read json | write csv"
   check tenzir "from ${INPUTSDIR}/json/empty-record.json read json | write xsv \" \" ; NULL"
 }
@@ -244,6 +244,7 @@ setup() {
   check tenzir "from ${INPUTSDIR}/zeek/merge.log read zeek-tsv | select uid | sort uid desc | write json"
   check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head | select service | sort service | write json"
   check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head | select service | sort service nulls-first | write json"
+  check tenzir "from ${INPUTSDIR}/pcap/zeek/conn.log.gz read zeek-tsv | select id | sort id.orig_h, id.orig_p, id.resp_h, id.resp_p | head 100 | write lines"
 }
 
 # bats test_tags=pipelines
@@ -469,6 +470,37 @@ EOF
   check tenzir 'show version | put line="55.3.244.1 GET /index.html 15824 0.043" | parse line grok "%{IP:client} %{WORD:method} %{URIPATHPARAM:request} %{NUMBER:bytes} %{NUMBER:duration}"'
 }
 
+# bats test_tags=pipelines
+@test "Print JSON in CEF" {
+  check tenzir "read cef | slice 1:3 | print extension json | select extension" <${INPUTSDIR}/cef/forcepoint.log
+  check ! tenzir "read cef | print extension.dvc json " <${INPUTSDIR}/cef/forcepoint.log
+}
+
+# bats test_tags=pipelines
+@test "Print CSV in CEF" {
+  check tenzir "read cef | slice 1:2 | print extension csv" <${INPUTSDIR}/cef/forcepoint.log
+  check tenzir "read cef | slice 1:2 | print extension csv --no-header | select extension" <${INPUTSDIR}/cef/forcepoint.log
+}
+
+# bats test_tags=pipelines
+@test "Print non UTF8 string" {
+  check ! tenzir "read cef | print extension feather" <${INPUTSDIR}/cef/forcepoint.log
+  check ! tenzir "read cef | print extension bitz" <${INPUTSDIR}/cef/forcepoint.log
+}
+
+@test "Print nested data" {
+  check tenzir "read json | print a csv | parse a csv" <${INPUTSDIR}/json/nested-object.json
+  check tenzir "read json | print a.b csv" <${INPUTSDIR}/json/nested-object.json
+  check tenzir "read json | print a.b zeek-tsv | parse a.b zeek-tsv" <${INPUTSDIR}/json/nested-object.json
+  check ! tenzir "read json | print a.b.c json" <${INPUTSDIR}/json/nested-object.json
+  check tenzir "read json | print a.b csv | print a yaml" <${INPUTSDIR}/json/nested-object.json
+}
+
+@test "Print multiple events" {
+  check tenzir "read json | repeat 4 | print a csv | parse a csv" <${INPUTSDIR}/json/nested-object.json
+  check ! tenzir "read json | repeat 2 | print a.b.c json" <${INPUTSDIR}/json/nested-object.json
+}
+
 # bats test_tags=pipelines, csv
 @test "CSV with comments" {
   check tenzir "from ${INPUTSDIR}/csv/ipblocklist.csv read csv --allow-comments"
@@ -480,6 +512,11 @@ EOF
   check tenzir "from ${INPUTSDIR}/xsv/sample.ssv read ssv | extend schema=#schema | write ssv"
   check tenzir "from ${INPUTSDIR}/xsv/sample.tsv read tsv | extend schema=#schema | write tsv"
   check tenzir "from ${INPUTSDIR}/xsv/nulls-and-escaping.csv read csv"
+  # Test that multiple batches only print the header once.
+  check tenzir "read json --ndjson --precise | select foo | write csv" <<EOF
+  {"foo": 1}
+  {"foo": 2, "bar": 3}
+EOF
 }
 
 @test "read xsv auto expand" {
@@ -492,16 +529,20 @@ EOF
 
 # bats test_tags=pipelines, xsv
 @test "Slice" {
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin 1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin -1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --end 1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --end -1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin 1 --end 1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin 1 --end 2"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin 1 --end -1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin -1 --end 1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin -1 --end -1"
-  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice --begin -2 --end -1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice 1:"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice -1:"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice :1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice :-1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice 1:1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice 1:2"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice 1:-1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice -1:1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice -1:-1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice -2:-1"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice 1::-2"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice :-1:-5"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice -10:-5:2"
+  check tenzir "from ${INPUTSDIR}/zeek/conn.log.gz read zeek-tsv | head 100 | enumerate | slice ::-1"
 }
 
 # bats test_tags=pipelines
@@ -679,5 +720,55 @@ EOF
   check tenzir 'read json | unflatten' <<EOF
 {"foo": {}}
 {"foo": null}
+EOF
+}
+
+@test "precise json" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": "0.042s"}
+{"foo": "0.043s", "bar": null}
+EOF
+}
+
+@test "precise json raw" {
+  check tenzir 'read json --ndjson --precise --raw' <<EOF
+{"foo": "0.042s"}
+{"foo": "0.043s", "bar": [{}]}
+EOF
+}
+
+@test "precise json overwrite field" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": "0.042s", "foo": 42}
+EOF
+}
+
+@test "precise json list type conflict" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": [42, "bar"]}
+EOF
+}
+
+@test "precise json big integer" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": 424242424242424242424242}
+EOF
+}
+
+@test "precise json incomplete input" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": 42
+EOF
+}
+
+@test "precise json broken input" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": 42,,,
+EOF
+}
+
+@test "precise json bad ndjson" {
+  check tenzir 'read json --ndjson --precise' <<EOF
+{"foo": 42}{"foo": 43}
 EOF
 }

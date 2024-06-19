@@ -24,6 +24,12 @@ node.
 Work on all diagnostic events as they are generated in real-time instead of on
 diagnostic events persisted at a Tenzir node.
 
+### `--retro`
+
+Work on persisted diagnostic events (first), even when `--live` is given.
+
+See [`export` operator](export.md#--retro) for more details.
+
 ## Schemas
 
 Tenzir emits diagnostic information with the following schema:
@@ -41,6 +47,7 @@ Contains detailed information about the diagnostic.
 |`severity`|`string`|The diagnostic severity.|
 |`notes`|`list<record>`|The diagnostic notes. Can be empty.|
 |`annotations`|`list<record>`|The diagnostic annotations. Can be empty.|
+|`rendered`|`string`|The rendered diagnostic, as printed on the command-line.|
 
 The record `notes` has the following schema:
 

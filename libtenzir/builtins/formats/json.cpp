@@ -25,9 +25,10 @@
 #include <tenzir/plugin.hpp>
 #include <tenzir/series_builder.hpp>
 #include <tenzir/to_lines.hpp>
-#include <tenzir/tql/parser.hpp>
+#include <tenzir/try_simdjson.hpp>
 
 #include <arrow/record_batch.h>
+#include <caf/detail/is_one_of.hpp>
 #include <caf/typed_event_based_actor.hpp>
 #include <fmt/format.h>
 
@@ -37,6 +38,11 @@
 namespace tenzir::plugins::json {
 
 namespace {
+
+/// This is the maximum size of a single object/event when *not* using the
+/// NDJSON mode. If this becomes problematic in the future, we can use a dynamic
+/// approach instead.
+constexpr auto max_object_size = size_t{10'000'000};
 
 inline auto split_at_crlf(generator<chunk_ptr> input)
   -> generator<std::optional<simdjson::padded_string_view>> {
@@ -142,6 +148,55 @@ struct selector {
   }
 };
 
+/// Given some `data`, this function computes a byte-sequence that uniquely
+/// identifies the type that would be returned by `type::infer`. However, it is
+/// much faster than using `type::infer`. We use this to identify the builder to
+/// use when `--precise` is given.
+///
+/// Note: This does not use `data_view` because that allocates. Also, we use
+/// `std::vector<std::byte>&` instead of a generic output iterator because
+/// output iterators have poor performance when appending ranges, which happens
+/// for field names here.
+void append_signature(const data& x, std::vector<std::byte>& out) {
+  caf::visit(
+    [&]<typename T>(const T& x) {
+      if constexpr (caf::detail::is_one_of<T, pattern, enumeration, map>::value) {
+        // Such values are not produced by `json_to_data`.
+        TENZIR_UNREACHABLE();
+      } else {
+        using Type = data_to_type_t<T>;
+        // Write out the type index. For complex types, this marks the start.
+        out.push_back(static_cast<std::byte>(Type::type_index));
+        if constexpr (basic_type<Type>) {
+          // We are done, no need for recursion.
+        } else {
+          // We have already written out the type index as a prefix and now do
+          // recursion with the inner types.
+          if constexpr (std::same_as<T, record>) {
+            for (auto& [name, value] : x) {
+              // Start a new field with a special marker.
+              out.push_back(std::byte{255});
+              // The field name is part of the type signature.
+              auto name_bytes = as_bytes(name);
+              out.insert(out.end(), name_bytes.begin(), name_bytes.end());
+              // And then, of course, the type of the field.
+              append_signature(value, out);
+            }
+          } else if constexpr (std::same_as<T, list>) {
+            for (auto& item : x) {
+              append_signature(item, out);
+            }
+          } else {
+            static_assert(detail::always_false_v<T>, "unhandled type");
+          }
+          // We write out the type index once more to mark the end.
+          out.push_back(static_cast<std::byte>(Type::type_index));
+        }
+      }
+    },
+    x);
+}
+
 constexpr auto unknown_entry_name = std::string_view{};
 
 struct entry_data {
@@ -171,6 +226,11 @@ struct parser_state {
   operator_control_plane& ctrl_;
   /// Maps schema names to indices for the `entries` member.
   detail::heterogeneous_string_hashmap<size_t> entry_map;
+  /// If `--precise` is set, we use this map instead of `entry_map`. Obviously,
+  /// this is not great, but a proper solution would require refactoring large
+  /// parts of this file due to bad extendability of the current design.
+  tsl::robin_map<std::vector<std::byte>, size_t, detail::hash_algorithm_proxy<>>
+    precise_map;
   /// Stores the schema-specific builders and some additional metadata.
   std::vector<entry_data> entries;
   /// The index of the currently active or last used builder.
@@ -235,6 +295,7 @@ struct parser_state {
   }
 };
 
+/// Parses simdjson objects into the given `series_builder` handles.
 class doc_parser {
 public:
   doc_parser(std::string_view parsed_document, operator_control_plane& ctrl,
@@ -377,35 +438,12 @@ private:
         }
         return add_value(builder, result.value_unsafe());
       }
-      default: {
-        // Newer versions of simdjson also have a `big_integer` number type.
-        // This check can be simplified once we require newer `simdjson` versions.
-        auto handle_big_integer = [&]<class T>(T kind) -> bool {
-          // This is written in a way where new number types lead to a
-          // compile-time warning/error.
-          if constexpr (requires { T::big_integer; }) {
-            switch (kind) {
-              case T::floating_point_number:
-              case T::signed_integer:
-              case T::unsigned_integer:
-                TENZIR_UNREACHABLE();
-              case T::big_integer:
-                report_parse_err(val, "a smaller number");
-                return false;
-            }
-          } else {
-            switch (kind) {
-              case T::floating_point_number:
-              case T::signed_integer:
-              case T::unsigned_integer:
-                TENZIR_UNREACHABLE();
-            }
-          }
-          TENZIR_UNREACHABLE();
-        };
-        return handle_big_integer(kind);
+      case simdjson::ondemand::number_type::big_integer: {
+        report_parse_err(val, "a smaller number");
+        return false;
       }
     }
+    TENZIR_UNREACHABLE();
   }
 
   [[nodiscard]] auto
@@ -507,6 +545,108 @@ private:
   bool raw_;
 };
 
+/// Converts a simdjson object into `data` object.
+///
+/// This is used when `--precise` is specified.
+auto json_to_data(simdjson::ondemand::value value, bool raw)
+  -> simdjson::simdjson_result<data>;
+
+auto json_to_data(simdjson::ondemand::object object, bool raw)
+  -> simdjson::simdjson_result<data> {
+  // The API of `record` is not optimal for this, hence we manually construct it.
+  auto result = std::vector<std::pair<std::string, data>>{};
+  for (auto maybe_field : object) {
+    TRY(auto field, maybe_field);
+    TRY(auto key, field.unescaped_key(false));
+    TRY(auto value, json_to_data(field.value(), raw));
+    // TODO: Reconsider, this is quadratic.
+    auto it = std::ranges::find(result, key, &record::value_type::first);
+    if (it != result.end()) {
+      it->second = std::move(value);
+    } else {
+      result.emplace_back(key, std::move(value));
+    }
+  }
+  return data{record::make_unsafe(std::move(result))};
+}
+
+auto json_to_data(simdjson::ondemand::array array, bool raw)
+  -> simdjson::simdjson_result<data> {
+  auto result = list{};
+  for (auto maybe_item : array) {
+    TRY(auto item, maybe_item);
+    TRY(auto data, json_to_data(item, raw));
+    result.push_back(std::move(data));
+  }
+  return data{std::move(result)};
+}
+
+auto json_to_data(simdjson::ondemand::number number, bool raw)
+  -> simdjson::simdjson_result<data> {
+  if (raw) {
+    return data{number.as_double()};
+  }
+  switch (number.get_number_type()) {
+    case simdjson::ondemand::number_type::floating_point_number:
+      return data{number.get_double()};
+    case simdjson::ondemand::number_type::signed_integer:
+      return data{number.get_int64()};
+    case simdjson::ondemand::number_type::unsigned_integer:
+      return data{number.get_uint64()};
+    case simdjson::ondemand::number_type::big_integer:
+      // It looks like this is unreachable anyway because the `number` type
+      // already requires that the value is not a big integer, thus the
+      // `BIGINT_ERROR` is already raised before calling this function, so
+      // strictly speaking, this line is unreachable.
+      return simdjson::BIGINT_ERROR;
+  }
+  TENZIR_UNREACHABLE();
+}
+
+auto json_to_data(std::string_view string, bool raw)
+  -> simdjson::simdjson_result<data> {
+  if (not raw) {
+    static constexpr auto parser
+      = parsers::time | parsers::duration | parsers::net | parsers::ip;
+    auto result = data{};
+    if (parser(string, result)) {
+      return result;
+    }
+  }
+  return data{std::string{string}};
+}
+
+auto json_to_data(simdjson::ondemand::value value, bool raw)
+  -> simdjson::simdjson_result<data> {
+  TRY(auto type, value.type());
+  switch (type) {
+    case simdjson::ondemand::json_type::array: {
+      TRY(auto array, value.get_array());
+      return json_to_data(array, raw);
+    }
+    case simdjson::ondemand::json_type::object: {
+      TRY(auto object, value.get_object());
+      return json_to_data(object, raw);
+    }
+    case simdjson::ondemand::json_type::number: {
+      TRY(auto number, value.get_number());
+      return json_to_data(number, raw);
+    }
+    case simdjson::ondemand::json_type::string: {
+      TRY(auto string, value.get_string());
+      return json_to_data(string, raw);
+    }
+    case simdjson::ondemand::json_type::boolean: {
+      TRY(auto boolean, value.get_bool());
+      return data{boolean};
+    }
+    case simdjson::ondemand::json_type::null: {
+      return data{caf::none};
+    }
+  }
+  TENZIR_UNREACHABLE();
+}
+
 auto get_schema_name(simdjson::ondemand::document_reference doc,
                      const selector& selector) -> caf::expected<std::string> {
   auto object = doc.get_value();
@@ -595,7 +735,7 @@ public:
   parser_base(operator_control_plane& ctrl, std::optional<selector> selector,
               std::optional<type> schema, std::vector<type> schemas,
               bool no_infer, bool preserve_order, bool raw,
-              bool arrays_of_objects)
+              bool arrays_of_objects, bool precise)
     : ctrl_{ctrl},
       selector_{std::move(selector)},
       schema_{std::move(schema)},
@@ -603,7 +743,8 @@ public:
       no_infer_{no_infer},
       preserve_order{preserve_order},
       raw_{raw},
-      arrays_of_objects_{arrays_of_objects} {
+      arrays_of_objects_{arrays_of_objects},
+      precise_{precise} {
   }
 
 protected:
@@ -705,6 +846,7 @@ protected:
   bool preserve_order = true;
   bool raw_ = false;
   bool arrays_of_objects_ = false;
+  bool precise_ = false;
   simdjson::ondemand::parser parser_;
   // TODO: change max table slice size to be fetched from options.
   int64_t max_table_slice_rows_ = defaults::import::table_slice_size;
@@ -728,40 +870,78 @@ public:
       co_return;
     }
     auto& doc = maybe_doc.value_unsafe();
-    auto [action, slices] = this->handle_selector(doc, json_line, state);
-    switch (action) {
-      case parser_action::parse:
-        break;
-      case parser_action::skip:
+    if (precise_) {
+      auto maybe_event = json_to_data(val.value_unsafe(), raw_);
+      if (maybe_event.error()) {
+        // TODO: Extra info?
+        diagnostic::warning("{}", simdjson::error_message(maybe_event.error()))
+          .note("at line {}", lines_processed_)
+          .emit(ctrl_.diagnostics());
         co_return;
-      case parser_action::yield:
-        TENZIR_ASSERT(slices);
+      }
+      auto event = std::move(maybe_event).value_unsafe();
+      if (not caf::holds_alternative<record>(event)) {
+        diagnostic::warning("skipping non-record JSON value: {}", event)
+          .note("at line {}", lines_processed_)
+          .emit(ctrl_.diagnostics());
+        co_return;
+      }
+      signature_.clear();
+      append_signature(event, signature_);
+      auto it = state.precise_map.find(signature_);
+      if (it == state.precise_map.end()) {
+        // TODO: We should eventually garbage collect this.
+        auto index = state.entries.size();
+        state.entries.emplace_back("tenzir.json", std::nullopt);
+        it = state.precise_map.emplace_hint(it, signature_, index);
+      }
+      if (auto slices = state.activate(it->second)) {
         for (auto& slice : *slices) {
           co_yield std::move(slice);
         }
-    }
-    auto& builder = state.get_active_entry().builder;
-    auto success
-      = doc_parser{json_line, this->ctrl_, lines_processed_, no_infer_, raw_}
-          .parse_object(val.value_unsafe(), builder.record());
-    // After parsing one JSON object it is expected for the result to be at
-    // the end. If it's otherwise then it means that a line contains more than
-    // one object in which case we don't add any data and emit a warning.
-    // It is also possible for a parsing failure to occurr in doc_parser. the
-    // is_alive() call ensures that the first object was parsed without
-    // errors. Calling at_end() when is_alive() returns false is unsafe and
-    // resulted in crashes.
-    if (success and not doc.at_end()) {
-      diagnostic::warning(
-        "encountered more than one JSON object in a single NDJSON line")
-        .note("skips remaining objects in line `{}`", json_line)
-        .emit(this->ctrl_.diagnostics());
-      success = false;
-    }
-    if (not success) {
-      // We already reported the issue.
-      builder.remove_last();
-      co_return;
+      }
+      state.get_active_entry().builder.data(event);
+      if (not doc.at_end()) {
+        diagnostic::warning(
+          "encountered more than one JSON object in a single NDJSON line")
+          .note("skips remaining objects in line `{}`", json_line)
+          .emit(this->ctrl_.diagnostics());
+      }
+    } else {
+      auto [action, slices] = this->handle_selector(doc, json_line, state);
+      switch (action) {
+        case parser_action::parse:
+          break;
+        case parser_action::skip:
+          co_return;
+        case parser_action::yield:
+          TENZIR_ASSERT(slices);
+          for (auto& slice : *slices) {
+            co_yield std::move(slice);
+          }
+      }
+      auto& builder = state.get_active_entry().builder;
+      auto success
+        = doc_parser{json_line, this->ctrl_, lines_processed_, no_infer_, raw_}
+            .parse_object(val.value_unsafe(), builder.record());
+      // After parsing one JSON object it is expected for the result to be at
+      // the end. If it's otherwise then it means that a line contains more than
+      // one object in which case we don't add any data and emit a warning.
+      // It is also possible for a parsing failure to occurr in doc_parser. the
+      // is_alive() call ensures that the first object was parsed without
+      // errors. Calling at_end() when is_alive() returns false is unsafe and
+      // resulted in crashes.
+      if (success and not doc.at_end()) {
+        diagnostic::warning(
+          "encountered more than one JSON object in a single NDJSON line")
+          .note("skips remaining objects in line `{}`", json_line)
+          .emit(this->ctrl_.diagnostics());
+        success = false;
+      }
+      if (not success) {
+        // We already reported the issue.
+        builder.remove_last();
+      }
     }
     if (auto slices = this->handle_max_rows(state)) {
       for (auto& slice : *slices) {
@@ -776,6 +956,7 @@ public:
 
 private:
   std::size_t lines_processed_ = 0u;
+  std::vector<std::byte> signature_;
 };
 
 class default_parser final : public parser_base {
@@ -787,10 +968,9 @@ public:
     buffer_.append(
       {reinterpret_cast<const char*>(json_chunk.data()), json_chunk.size()});
     auto view = buffer_.view();
-    auto err = this->parser_
-                 .iterate_many(view.data(), view.length(),
-                               simdjson::ondemand::DEFAULT_BATCH_SIZE)
-                 .get(stream_);
+    auto err
+      = this->parser_.iterate_many(view.data(), view.length(), max_object_size)
+          .get(stream_);
     if (err) {
       // For the simdjson 3.1 it seems impossible to have an error
       // returned here so it is hard to understand if we can recover from
@@ -830,8 +1010,8 @@ public:
         auto arr = doc.value_unsafe().get_array();
         if (arr.error()) {
           state.abort_requested = true;
-          diagnostic::error("{}", error_message(err))
-            .note("expected an array of objects")
+          diagnostic::error("expected an array of objects")
+            .note("got: {}", view)
             .emit(this->ctrl_.diagnostics());
           co_return;
         }
@@ -975,6 +1155,7 @@ struct parser_args {
   bool preserve_order = true;
   bool raw = false;
   bool arrays_of_objects = false;
+  bool precise = false;
 
   template <class Inspector>
   friend auto inspect(Inspector& f, parser_args& x) -> bool {
@@ -987,13 +1168,18 @@ struct parser_args {
               f.field("use_ndjson_mode", x.use_ndjson_mode),
               f.field("preserve_order", x.preserve_order),
               f.field("raw", x.raw),
-              f.field("arrays_of_objects", x.arrays_of_objects));
+              f.field("arrays_of_objects", x.arrays_of_objects),
+              f.field("precise", x.precise));
   }
 };
 
-void add_common_options_to_parser(argument_parser& parser, parser_args& args) {
+void add_no_infer_option(argument_parser& parser, parser_args& args) {
   // TODO: Rename this option.
   parser.add("--no-infer", args.no_infer);
+}
+
+void add_raw_option(argument_parser& parser, parser_args& args) {
+  parser.add("--raw", args.raw);
 }
 
 class json_parser final : public plugin_parser {
@@ -1057,6 +1243,12 @@ public:
         .emit(ctrl.diagnostics());
       return {};
     }
+    if (args_.precise and not(args_.use_ndjson_mode || args_.use_gelf_mode)) {
+      diagnostic::error(
+        "option `--precise` requires `--ndjson` or `--gelf` for now")
+        .emit(ctrl.diagnostics());
+      return {};
+    }
     if (args_.use_ndjson_mode) {
       return make_parser(split_at_crlf(std::move(input)), ctrl,
                          args_.unnest_separator, schema, args_.preserve_order,
@@ -1069,6 +1261,7 @@ public:
                            args_.preserve_order,
                            args_.raw,
                            args_.arrays_of_objects,
+                           args_.precise,
                          });
     }
     if (args_.use_gelf_mode) {
@@ -1083,6 +1276,7 @@ public:
                            args_.preserve_order,
                            args_.raw,
                            args_.arrays_of_objects,
+                           args_.precise,
                          });
     }
     return make_parser(std::move(input), ctrl, args_.unnest_separator, schema,
@@ -1096,6 +1290,7 @@ public:
                          args_.preserve_order,
                          args_.raw,
                          args_.arrays_of_objects,
+                         args_.precise,
                        });
   }
 
@@ -1115,6 +1310,7 @@ struct printer_args {
   std::optional<location> omit_nulls;
   std::optional<location> omit_empty_objects;
   std::optional<location> omit_empty_lists;
+  std::optional<location> arrays_of_objects;
 
   template <class Inspector>
   friend auto inspect(Inspector& f, printer_args& x) -> bool {
@@ -1126,7 +1322,8 @@ struct printer_args {
               f.field("omit_empty", x.omit_empty),
               f.field("omit_nulls", x.omit_nulls),
               f.field("omit_empty_objects", x.omit_empty_objects),
-              f.field("omit_empty_lists", x.omit_empty_lists));
+              f.field("omit_empty_lists", x.omit_empty_lists),
+              f.field("arrays_of_objects", x.arrays_of_objects));
   }
 };
 
@@ -1156,10 +1353,13 @@ public:
       = args_.omit_empty_objects.has_value() or args_.omit_empty.has_value();
     const auto omit_empty_lists
       = args_.omit_empty_lists.has_value() or args_.omit_empty.has_value();
-    auto meta = chunk_metadata{.content_type = compact ? "application/x-ndjson"
-                                                       : "application/json"};
+    const auto arrays_of_objects = args_.arrays_of_objects.has_value();
+    auto meta = chunk_metadata{.content_type = compact and not arrays_of_objects
+                                                 ? "application/x-ndjson"
+                                                 : "application/json"};
     return printer_instance::make(
       [compact, style, omit_nulls, omit_empty_objects, omit_empty_lists,
+       arrays_of_objects,
        meta = std::move(meta)](table_slice slice) -> generator<chunk_ptr> {
         if (slice.rows() == 0) {
           co_yield {};
@@ -1178,10 +1378,28 @@ public:
         auto buffer = std::vector<char>{};
         auto resolved_slice = resolve_enumerations(slice);
         auto out_iter = std::back_inserter(buffer);
-        for (const auto& row : resolved_slice.values()) {
-          const auto ok = printer.print(out_iter, row);
-          TENZIR_ASSERT(ok);
-          out_iter = fmt::format_to(out_iter, "\n");
+        auto rows = resolved_slice.values();
+        auto row = rows.begin();
+        if (not arrays_of_objects) {
+          for (; row != rows.end(); ++row) {
+            const auto ok = printer.print(out_iter, *row);
+            TENZIR_ASSERT(ok);
+            out_iter = fmt::format_to(out_iter, "\n");
+          }
+        } else {
+          out_iter = fmt::format_to(out_iter, "[");
+          if (row != rows.end()) {
+            const auto ok = printer.print(out_iter, *row);
+            TENZIR_ASSERT(ok);
+            ++row;
+          }
+          for (; row != rows.end(); ++row) {
+            *out_iter++ = ',';
+            *out_iter++ = compact ? ' ' : '\n';
+            const auto ok = printer.print(out_iter, *row);
+            TENZIR_ASSERT(ok);
+          }
+          out_iter = fmt::format_to(out_iter, "]\n");
         }
         auto chunk = chunk::make(std::move(buffer), meta);
         co_yield std::move(chunk);
@@ -1191,6 +1409,10 @@ public:
   auto allows_joining() const -> bool override {
     return true;
   };
+
+  auto prints_utf8() const -> bool override {
+    return true;
+  }
 
   friend auto inspect(auto& f, json_printer& x) -> bool {
     return f.apply(x.args_);
@@ -1216,10 +1438,11 @@ public:
     parser.add("--selector", selector, "<selector>");
     parser.add("--schema", args.schema, "<schema>");
     parser.add("--unnest-separator", args.unnest_separator, "<separator>");
-    add_common_options_to_parser(parser, args);
+    add_no_infer_option(parser, args);
     parser.add("--ndjson", args.use_ndjson_mode);
     parser.add("--gelf", args.use_gelf_mode);
-    parser.add("--raw", args.raw);
+    parser.add("--precise", args.precise);
+    add_raw_option(parser, args);
     parser.add("--arrays-of-objects", args.arrays_of_objects);
     parser.parse(p);
     if (selector) {
@@ -1253,6 +1476,7 @@ public:
     parser.add("--omit-nulls", args.omit_nulls);
     parser.add("--omit-empty-objects", args.omit_empty_objects);
     parser.add("--omit-empty-lists", args.omit_empty_lists);
+    parser.add("--arrays-of-objects", args.arrays_of_objects);
     parser.parse(p);
     return std::make_unique<json_printer>(std::move(args));
   }
@@ -1269,9 +1493,10 @@ public:
     auto parser = argument_parser{
       name(), fmt::format("https://docs.tenzir.com/formats/{}", name())};
     auto args = parser_args{};
-    add_common_options_to_parser(parser, args);
+    add_raw_option(parser, args);
     parser.parse(p);
     args.use_gelf_mode = true;
+    args.precise = true;
     return std::make_unique<json_parser>(std::move(args));
   }
 };
@@ -1289,7 +1514,7 @@ public:
     auto parser = argument_parser{
       name(), fmt::format("https://docs.tenzir.com/formats/{}", name())};
     auto args = parser_args{};
-    add_common_options_to_parser(parser, args);
+    add_no_infer_option(parser, args);
     parser.parse(p);
     args.use_ndjson_mode = true;
     args.selector = parse_selector(Selector.str(), location::unknown);

@@ -25,8 +25,12 @@ auto format_metric(const metric& metric) -> std::string {
   auto result = std::string{};
   auto it = std::back_inserter(result);
   constexpr auto indent = std::string_view{"  "};
-  it = fmt::format_to(it, "operator #{} ({})\n", metric.operator_index + 1,
+  it = fmt::format_to(it, "operator #{} ({})", metric.operator_index + 1,
                       metric.operator_name);
+  if (metric.internal) {
+    it = fmt::format_to(it, " (internal)");
+  }
+  it = fmt::format_to(it, "\n");
   it = fmt::format_to(it, "{}total: {}\n", indent, data{metric.time_total});
   it = fmt::format_to(it, "{}scheduled: {} ({:.2f}%)\n", indent,
                       data{metric.time_scheduled},
@@ -222,7 +226,7 @@ auto exec_pipeline(std::string content,
         if (msg.reason) {
           result = msg.reason;
         }
-        self->quit(msg.reason);
+        self->quit();
       });
       self->state.executor = self->spawn<caf::monitored>(
         pipeline_executor, std::move(pipe),

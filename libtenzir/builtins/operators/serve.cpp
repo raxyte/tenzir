@@ -55,7 +55,6 @@
 #include <tenzir/concept/parseable/to.hpp>
 #include <tenzir/concept/printable/tenzir/json.hpp>
 #include <tenzir/detail/weak_run_delayed.hpp>
-#include <tenzir/format/json.hpp>
 #include <tenzir/node.hpp>
 #include <tenzir/node_control.hpp>
 #include <tenzir/pipeline.hpp>
@@ -69,6 +68,8 @@
 #include <arrow/record_batch.h>
 #include <caf/stateful_actor.hpp>
 #include <caf/typed_event_based_actor.hpp>
+
+#include <sstream>
 
 namespace tenzir::plugins::serve {
 
@@ -774,7 +775,15 @@ struct serve_handler_state {
         [rp](caf::error& err) mutable {
           // TODO: Use a struct with distinct fields for user-facing
           // error message and detail here.
-          auto rsp = rest_response::make_error(400, fmt::to_string(err), {});
+          // TODO: We don't have the source here to print snippets of the
+          // diagnostic! Either `serve` needs to be aware of that (which seems
+          // like a very bad idea), or the diagnostics need to be rendered
+          // somewhere else.
+          auto stream = std::stringstream{};
+          auto printer = make_diagnostic_printer(
+            std::nullopt, color_diagnostics::yes, stream);
+          printer->emit(diagnostic::error(err).done());
+          auto rsp = rest_response::make_error(400, stream.str(), {});
           rp.deliver(std::move(rsp));
         });
     return rp;

@@ -69,7 +69,10 @@ platform=
 os=$(uname -s)
 if [ "${os}" = "Linux" ]
 then
-    if [ -f "/etc/debian_version" ]
+    if check rpm && [ -n "$(rpm -qa 2>/dev/null)" ]
+    then
+        platform=RPM
+    elif [ -f "/etc/debian_version" ]
     then
         platform=Debian
     elif [ -f "/etc/NIXOS" ]
@@ -121,7 +124,10 @@ else
   # Select appropriate package.
   action "Identifying package"
   package_url_base="https://storage.googleapis.com/tenzir-dist-public/packages/main"
-  if [ "${platform}" = "Debian" ]
+  if [ "${platform}" = "RPM" ]
+  then
+    package_url="${package_url_base}/rpm/tenzir-static-latest.rpm"
+  elif [ "${platform}" = "Debian" ]
   then
     package_url="${package_url_base}/debian/tenzir-static-latest.deb"
   elif [ "${platform}" = "Linux" ]
@@ -158,6 +164,7 @@ echo "Using ${package}"
 # Download package.
 tmpdir="$(dirname "$(mktemp -u)")"
 action "Downloading ${package_url}"
+rm -f "${tmpdir}/${package}"
 # Wget does not support the file:// URL scheme.
 if check wget && beginswith "${package_url}" "https://"
 then
@@ -203,14 +210,21 @@ fi
 
 # Trigger installation.
 action "Installing package into ${prefix}"
-if [ "${platform}" = "Debian" ]
+if [ "${platform}" = "RPM" ]
 then
-  # adduser is required by the Debian package installation.
-  if ! check adduser
-  then
-    echo "Could not find ${bold}adduser${normal} in \$PATH."
-    exit 1
-  fi
+  cmd1="$sudo yum -y localinstall \"${tmpdir}/${package}\""
+  cmd2="$sudo systemctl status tenzir-node || [ ! -d /run/systemd/system ]"
+  echo "This script is about to run the following commands:"
+  echo
+  echo "  - ${cmd1}"
+  echo "  - ${cmd2}"
+  confirm
+  action "Installing via yum"
+  eval "${cmd1}"
+  action "Checking node status"
+  eval "${cmd2}"
+elif [ "${platform}" = "Debian" ]
+then
   cmd1="$sudo apt-get --yes install \"${tmpdir}/${package}\""
   cmd2="$sudo systemctl status tenzir-node || [ ! -d /run/systemd/system ]"
   echo "This script is about to run the following commands:"
@@ -225,12 +239,16 @@ then
 elif [ "${platform}" = "Linux" ]
 then
   cmd1="$sudo tar xzf \"${tmpdir}/${package}\" -C /"
+  cmd2="$sudo echo 'export PATH=\$PATH:/opt/tenzir/bin' > /etc/profile.d/tenzir.sh"
   echo "This script is about to run the following command:"
   echo
   echo "  - ${cmd1}"
+  echo "  - ${cmd2}"
   confirm
   action "Unpacking tarball"
   eval "${cmd1}"
+  action "Adding /opt/tenzir/bin to the system path"
+  eval "${cmd2}"
 elif [ "${platform}" = "macOS" ]
 then
   cmd1="$sudo installer -pkg \"${tmpdir}/${package}\" -target /"

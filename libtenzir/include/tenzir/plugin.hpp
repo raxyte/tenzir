@@ -12,12 +12,10 @@
 
 #include "tenzir/actors.hpp"
 #include "tenzir/command.hpp"
-#include "tenzir/config_options.hpp"
 #include "tenzir/data.hpp"
 #include "tenzir/detail/assert.hpp"
 #include "tenzir/detail/debug_writer.hpp"
 #include "tenzir/detail/pp.hpp"
-#include "tenzir/detail/weak_handle.hpp"
 #include "tenzir/expression.hpp"
 #include "tenzir/http_api.hpp"
 #include "tenzir/operator_control_plane.hpp"
@@ -157,46 +155,6 @@ public:
   virtual component_plugin_actor
   make_component(node_actor::stateful_pointer<node_state> node) const
     = 0;
-};
-
-// -- analyzer plugin ----------------------------------------------------------
-
-/// A base class for plugins that hook into the input stream.
-/// @relates component_plugin
-class analyzer_plugin : public virtual component_plugin {
-public:
-  /// Gets or spawns the ANALYZER actor spawned by the plugin.
-  /// @param node A pointer to the NODE actor handle. This argument is optional
-  /// for retrieving an already spawned ANALYZER.
-  /// @returns The actor handle to the analyzer, or `nullptr` if the actor was
-  /// spawned but shut down already.
-  analyzer_plugin_actor
-  analyzer(node_actor::stateful_pointer<node_state> node = nullptr) const;
-
-  /// Implicitly fulfill the requirements of a COMPONENT PLUGIN actor via the
-  /// ANALYZER PLUGIN actor.
-  component_plugin_actor
-  make_component(node_actor::stateful_pointer<node_state> node) const final;
-
-protected:
-  /// Creates an actor that hooks into the input table slice stream.
-  /// @param node A stateful pointer to the NODE actor.
-  /// @returns The actor handle to the analyzer.
-  /// @note It is guaranteed that this function is not called while the ANALYZER
-  /// is still running.
-  /// @note This function runs in the actor context of the NODE actor and can
-  /// safely access the NODE's state.
-  virtual analyzer_plugin_actor
-  make_analyzer(node_actor::stateful_pointer<node_state> node) const
-    = 0;
-
-private:
-  /// A weak handle to the spawned actor handle.
-  mutable detail::weak_handle<analyzer_plugin_actor> weak_handle_ = {};
-
-  /// Indicates that the ANALYZER was spawned at least once. This flag is used
-  /// to ensure that `make_analyzer` is called at most once per plugin.
-  mutable bool spawned_once_ = false;
 };
 
 // -- command plugin -----------------------------------------------------------
@@ -373,6 +331,10 @@ public:
   virtual auto default_parser() const -> std::string {
     return "json";
   }
+
+  virtual auto internal() const -> bool {
+    return false;
+  }
 };
 
 /// @see operator_parser_plugin
@@ -492,6 +454,10 @@ public:
   /// Returns whether the printer allows for joining output streams into a
   /// single saver.
   virtual auto allows_joining() const -> bool = 0;
+
+  /// Returns whether it is safe to assume that the printer returns text that is
+  /// encoded as UTF8.
+  virtual auto prints_utf8() const -> bool = 0;
 };
 
 /// @see operator_parser_plugin
@@ -536,6 +502,10 @@ public:
 
   virtual auto default_printer() const -> std::string {
     return "json";
+  }
+
+  virtual auto internal() const -> bool {
+    return false;
   }
 };
 
@@ -729,7 +699,7 @@ public:
   /// @param array The values to look up in the context.
   /// @param replace If true, return the input values for missing fields rather
   /// than nulls.
-  virtual auto apply(series array, bool replace) const
+  virtual auto apply(series array, bool replace)
     -> caf::expected<std::vector<series>>
     = 0;
 
