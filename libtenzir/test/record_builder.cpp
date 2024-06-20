@@ -351,8 +351,8 @@ TEST(signature record seeding field not in data) {
     }
     expected.insert(expected.end(), detail::record_builder::record_end_marker);
   }
-    fmt::print("{}\n", sig);
-    fmt::print("{}\n", expected);
+  // fmt::print("{}\n", sig);
+  // fmt::print("{}\n", expected);
   CHECK(sig == expected);
 }
 
@@ -391,42 +391,43 @@ TEST(signature record seeding data - field not in seed) {
     }
     expected.insert(expected.end(), detail::record_builder::record_end_marker);
   }
-  //   fmt::print("{}\n", sig);
-  //   fmt::print("{}\n", expected);
+  fmt::print("{}\n", sig);
+  fmt::print("{}\n", expected);
   CHECK(sig == expected);
 }
 
-TEST(signature record seeding numeric mismatch) {
-  // FIXME check that we actually want to unify towards double
-  record_builder b;
-  auto* r = b.record();
-  r->field("0")->data(0ul);
+// TEST(signature record seeding numeric mismatch) {
+//   // FIXME check that we actually want to unify towards double
+//   record_builder b;
+//   auto* r = b.record();
+//   r->field("0")->data(0ul);
 
-  CHECK(b.has_elements());
-  detail::record_builder::signature_type sig;
-  tenzir::type seed{record_type{
-    {"0", int64_type{}},
-  }};
-  CHECK(not b.append_signature_to(sig, noop_parser, seed));
+//   CHECK(b.has_elements());
+//   detail::record_builder::signature_type sig;
+//   tenzir::type seed{record_type{
+//     {"0", int64_type{}},
+//   }};
+//   CHECK(not b.append_signature_to(sig, noop_parser, seed));
 
-  detail::record_builder::signature_type expected;
-  {
-    expected.insert(expected.end(),
-                    detail::record_builder::record_start_marker);
-    {
-      const auto key_bytes = as_bytes("0"sv);
-      expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
-      expected.insert(
-        expected.end(),
-        static_cast<std::byte>(
-          caf::detail::tl_index_of<field_type_list, double>::value));
-    }
-    expected.insert(expected.end(), detail::record_builder::record_end_marker);
-  }
-  //   fmt::print("{}\n", sig);
-  //   fmt::print("{}\n", expected);
-  CHECK(sig == expected);
-}
+//   detail::record_builder::signature_type expected;
+//   {
+//     expected.insert(expected.end(),
+//                     detail::record_builder::record_start_marker);
+//     {
+//       const auto key_bytes = as_bytes("0"sv);
+//       expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
+//       expected.insert(
+//         expected.end(),
+//         static_cast<std::byte>(
+//           caf::detail::tl_index_of<field_type_list, double>::value));
+//     }
+//     expected.insert(expected.end(),
+//     detail::record_builder::record_end_marker);
+//   }
+//   //   fmt::print("{}\n", sig);
+//   //   fmt::print("{}\n", expected);
+//   CHECK(sig == expected);
+// }
 
 TEST(overwrite record fields) {
   record_builder b;

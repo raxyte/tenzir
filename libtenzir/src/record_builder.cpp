@@ -368,6 +368,16 @@ auto node_list::find_free() -> node_field* {
   return nullptr;
 }
 
+auto node_list::back() -> node_field& {
+  for (size_t i = 0; i < data_.size(); ++i) {
+    if (not data_[i].is_alive()) {
+      return data_[i - 1];
+    }
+  }
+  TENZIR_UNREACHABLE();
+  return data_.back();
+}
+
 auto node_list::reserve(size_t N) -> void {
   data_.reserve(N);
 }
@@ -412,9 +422,24 @@ auto node_list::null() -> void {
   return data(caf::none);
 }
 
+void node_list::update_new_structural_signature() {
+  
+  if (current_structural_signature_.empty()) {
+    current_structural_signature_ = std::move(new_structural_signature_);
+  } else if (new_structural_signature_ != current_structural_signature_) {
+    type_index_ = type_index_mismatch;
+  }
+}
+
 auto node_list::record() -> node_record* {
   mark_this_alive();
-  update_type_index(type_index_, type_index_record);
+  update_type_index(
+    type_index_,
+    type_index_record); // FIXME this is not correct, it would need to verify
+                        // that the signatures of the elements actually match
+  if (type_index_ != type_index_empty and type_index_ != type_index_mismatch) {
+    update_new_structural_signature();
+  }
   if (auto* free = find_free()) {
     if (auto* r = free->get_if<node_record>()) {
       return r;
@@ -422,14 +447,18 @@ auto node_list::record() -> node_record* {
       return &free->data_.emplace<node_record>();
     }
   } else {
-    TENZIR_ASSERT(data_.size() <= 20'000, "Upper limit on list size reached.");
+    TENZIR_ASSERT(data_.size() <= 20'000,
+                  "Upper limit on record size reached.");
     return data_.emplace_back().record();
   }
 }
 
 auto node_list::list() -> node_list* {
   mark_this_alive();
-  update_type_index(type_index_, type_index_list);
+  update_type_index(
+    type_index_,
+    type_index_list); // FIXME this is not correct, it would need to verify that
+                      // the signatures of the elements actually match
   if (auto* free = find_free()) {
     if (auto* r = free->get_if<node_list>()) {
       return r;

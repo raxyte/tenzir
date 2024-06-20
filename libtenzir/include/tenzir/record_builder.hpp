@@ -19,6 +19,7 @@
 #include <caf/expected.hpp>
 
 #include <cstddef>
+#include <iostream>
 #include <string>
 #include <utility>
 #include <variant>
@@ -29,10 +30,11 @@ namespace tenzir {
 class record_builder;
 namespace detail::record_builder {
 
-template <typename T>
-concept data_parsing_function = requires(T t, std::string s, const tenzir::type* seed) {
-  { t(s,seed) } -> std::same_as<caf::expected<tenzir::data>>;
-};
+template <typename P>
+concept data_parsing_function
+  = requires(P parser, std::string str, const tenzir::type* seed) {
+      { parser(str, seed) } -> std::same_as<caf::expected<tenzir::data>>;
+    };
 
 class node_record;
 class node_field;
@@ -152,9 +154,6 @@ private:
   flat_map<std::string, size_t> lookup_;
 };
 
-// TODO support structured data by pulling it apart in `field.data` and
-// `list.data` calls
-
 class node_list : public node_base {
   friend class node_record;
   friend class node_field;
@@ -191,6 +190,9 @@ private:
   /// finds an element marked as dead. This is part of the reallocation
   /// optimization.
   auto find_free() -> node_field*;
+  auto back() -> node_field&;
+
+  auto update_new_structural_signature() -> void;
 
   // (re-)seeds the field to match the given type. If the field is alive, this
   // has no effect
@@ -207,6 +209,8 @@ private:
   auto clear() -> void;
 
   size_t type_index_;
+  signature_type current_structural_signature_;
+  signature_type new_structural_signature_;
   std::vector<node_field> data_;
 };
 
@@ -314,10 +318,6 @@ public:
   template <detail::record_builder::non_structured_data_type T>
   [[nodiscard]] auto find_value_typed(std::string_view key) -> T*;
 
-  /// TODO it may still be possible to compute the signature "live"
-  /// each node would need a pointer to the builder to write to a member there.
-  /// overwrites would then trigger a recompute
-  /// this depends on whether we have an insertion order stable map
   using signature_type = typename detail::record_builder::signature_type;
   /// computes the "signature" of the currently built record.
   template <detail::record_builder::data_parsing_function Parser>
@@ -332,8 +332,7 @@ public:
 
   /// materializes the currently build record
   /// @param mark_dead whether to mark nodes in the record builder as dead
-  [[nodiscard]] auto
-  materialize(bool mark_dead = true) -> tenzir::record; // TODO implement this
+  [[nodiscard]] auto materialize(bool mark_dead = true) -> tenzir::record;
   /// commits the current record into the series builder
   /// @param mark_dead whether to mark nodes in the record builder as dead
   auto commit_to(series_builder&, bool mark_dead = true) -> void;
@@ -380,22 +379,31 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
   for (const auto& [k, index] : lookup_) {
     auto& field = data_[index].value;
     if (field.affects_signature()) {
-      tenzir::type field_seed;
       if (seed) {
+        bool handled_by_seed = false;
         // TODO is this a good idea????? I dont see any other way to
         // find the type for a field with a given name
         // a non-generator based API to get these would be ideal, so
         // we dont have to iterate for every key
         for (auto [seed_key, seed_type] : seed->fields()) {
           if (seed_key == k) {
-            field_seed = std::move(seed_type);
+            handled_by_seed = true;
+            const auto key_bytes = as_bytes(k);
+            sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
+            auto e = field.append_to_signature(sig, p, &seed_type);
+            if (e) {
+              return e;
+            }
             break;
           }
+        }
+        if (handled_by_seed) {
+          continue;
         }
       }
       const auto key_bytes = as_bytes(k);
       sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
-      auto e = field.append_to_signature(sig, p, seed ? &field_seed : nullptr);
+      auto e = field.append_to_signature(sig, p);
       if (e) {
         return e;
       }
@@ -419,7 +427,7 @@ auto node_field::parse(Parser& p, const tenzir::type* seed) -> caf::error {
   }
   TENZIR_ASSERT(std::holds_alternative<std::string>(data_));
   std::string& raw = std::get<std::string>(data_);
-  auto res = p(std::move(raw),seed);
+  auto res = p(std::move(raw), seed);
   if (res) {
     data(*res);
     return {};
@@ -431,12 +439,11 @@ template <data_parsing_function Parser>
 auto node_field::append_to_signature(signature_type& sig, Parser& p,
                                      const tenzir::type* seed) -> caf::error {
   if (is_raw_) {
-    auto e = parse(p,seed);
+    auto e = parse(p, seed);
     if (e != caf::error{}) {
       return e;
     }
   }
-
   const auto visitor = detail::overload{
     [&sig, &p, seed](node_list& v) {
       const auto* ls = caf::get_if<list_type>(seed);
@@ -460,8 +467,35 @@ auto node_field::append_to_signature(signature_type& sig, Parser& p,
       }
       return caf::error{};
     },
+    [&sig, p, seed, this](caf::none_t&) {
+      // none could be the result of pre-seeding or being built with a true null
+      // via the API for the first case we need to ensure we continue doing
+      // seeing if we have a seed
+      if (seed) {
+        if (auto sr = caf::get_if<tenzir::record_type>(seed)) {
+          return record()->append_to_signature(sig, p, sr);
+        }
+        if (auto sl = caf::get_if<tenzir::list_type>(seed)) {
+          return list()->append_to_signature(sig, p, sl);
+        }
+        sig.push_back(static_cast<std::byte>(seed->type_index()));
+        return caf::error{};
+      } else {
+        constexpr static auto type_idx
+          = caf::detail::tl_index_of<field_type_list, caf::none_t>::value;
+        sig.push_back(static_cast<std::byte>(type_idx));
+        return caf::error{};
+      }
+    },
     [&sig, seed]<non_structured_data_type T>(T&) {
       size_t type_idx = caf::detail::tl_index_of<field_type_list, T>::value;
+      if (seed and type_idx != seed->type_index()) {
+        // FIXME are there cases where we may want to still reconcile this?
+        // technically if we run into this case, its an issue of the calling
+        // parsers implementation, which did early parsing before knowing a seed
+        return caf::make_error(ec::type_clash, "type mismatch between parsed "
+                                               "event and selected schema");
+      }
       sig.push_back(static_cast<std::byte>(type_idx));
       return caf::error{};
     },
@@ -485,10 +519,8 @@ static inline auto is_structural(size_t idx) -> bool {
 
 constexpr static size_t type_index_empty
   = caf::detail::tl_size<field_type_list>::value;
-constexpr static size_t type_index_generic_number
-  = caf::detail::tl_index_of<field_type_list, double>::value;
-constexpr static size_t type_index_string
-  = caf::detail::tl_index_of<field_type_list, std::string>::value;
+  constexpr static size_t type_index_mismatch
+  = caf::detail::tl_size<field_type_list>::value + 1;
 constexpr static size_t type_index_list
   = caf::detail::tl_index_of<field_type_list, node_list>::value;
 constexpr static size_t type_index_record
@@ -498,21 +530,15 @@ static inline auto is_null(size_t idx) -> bool {
   return idx == caf::detail::tl_index_of<field_type_list, caf::none_t>::value;
 }
 
-static inline auto is_number_like(size_t idx) -> auto {
-  switch (idx) {
-    case caf::detail::tl_index_of<field_type_list, bool>::value:
-    case caf::detail::tl_index_of<field_type_list, int64_t>::value:
-    case caf::detail::tl_index_of<field_type_list, uint64_t>::value:
-    case caf::detail::tl_index_of<field_type_list, double>::value:
-    case caf::detail::tl_index_of<field_type_list, enumeration>::value:
-      return true;
-    default:
-      return false;
+static inline auto
+update_type_index(size_t& old_index, size_t new_index) -> void {
+  if ( old_index == type_index_mismatch ) {
+    return;
   }
-}
-
-static inline auto update_type_index(size_t& old_index, size_t new_index) -> void {
   if (old_index == new_index) {
+    return;
+  }
+  if (is_null(new_index)) {
     return;
   }
   if (old_index == type_index_empty) {
@@ -523,15 +549,7 @@ static inline auto update_type_index(size_t& old_index, size_t new_index) -> voi
     old_index = new_index;
     return;
   }
-  if (is_null(new_index)) {
-    return;
-  }
-  if (is_number_like(old_index) and is_number_like(new_index)) {
-    old_index = type_index_generic_number;
-    return;
-  }
-  // TODO converting numbers to durations&times
-  old_index = type_index_string;
+  old_index = type_index_mismatch;
 }
 
 template <non_structured_data_type T>
@@ -549,18 +567,25 @@ auto node_list::data(T data) -> void {
 
 template <data_parsing_function Parser>
 auto node_list::append_to_signature(
-  /// TODO update signature computation after parsing of fields
   signature_type& sig, Parser& p, const tenzir::list_type* seed) -> caf::error {
   sig.push_back(list_start_marker);
   if (data_.empty() and not seed) {
-    return {};
+    ; // noop
   }
-  sig.push_back(static_cast<std::byte>(type_index_));
-  if (is_structural(type_index_)) {
+  else if ( type_index_ == type_index_mismatch ) {
+    // FIXME implement manual type inference
+  }
+  else if ( is_structural(type_index_)) {
     if (seed) {
       const auto s = seed->value_type();
-      return data_.front().append_to_signature(sig, p, &s);
+      auto e = data_.front().append_to_signature(sig, p, &s);
+      if ( e ) {
+        return e;
+      }
     }
+  }
+  else {
+    sig.push_back(static_cast<std::byte>(type_index_));
   }
   sig.push_back(list_end_marker);
   return {};
