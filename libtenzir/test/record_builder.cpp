@@ -112,6 +112,37 @@ TEST(materialization record list record) {
   CHECK(not b.has_elements());
 }
 
+TEST(overwrite record fields) {
+  record_builder b;
+  auto* r = b.record();
+  r->field("0")->data(0ul);
+  r->field("0")->data(0l);
+  r->field("0")->data(0.0);
+  r->field("0")->data(0ul);
+
+  CHECK(b.has_elements());
+  detail::record_builder::signature_type sig;
+  CHECK(not b.append_signature_to(sig, noop_parser));
+
+  detail::record_builder::signature_type expected;
+  {
+    expected.insert(expected.end(),
+                    detail::record_builder::record_start_marker);
+    {
+      const auto key_bytes = as_bytes("0"sv);
+      expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
+      expected.insert(
+        expected.end(),
+        static_cast<std::byte>(
+          caf::detail::tl_index_of<field_type_list, uint64_t>::value));
+    }
+    expected.insert(expected.end(), detail::record_builder::record_end_marker);
+  }
+  //   fmt::print("{}\n", sig);
+  //   fmt::print("{}\n", expected);
+  CHECK(sig == expected);
+}
+
 TEST(signature record empty) {
   record_builder b;
   (void)b.record();
@@ -219,7 +250,6 @@ TEST(signature list with null) {
 }
 
 TEST(signature list numeric unification) {
-  /// FIXME update to new parser setup
   record_builder b;
   auto* l = b.record()->field("l")->list();
   l->data(0ul);
@@ -238,40 +268,12 @@ TEST(signature list numeric unification) {
     expected.insert(expected.end(), detail::record_builder::list_start_marker);
     expected.insert(
       expected.end(),
-      static_cast<std::byte>(
-        caf::detail::tl_index_of<field_type_list, double>::value));
+      static_cast<std::byte>(detail::record_builder::type_index_double));
     expected.insert(expected.end(), detail::record_builder::list_end_marker);
     expected.insert(expected.end(), detail::record_builder::record_end_marker);
   }
-  CHECK(sig == expected);
-}
-
-TEST(signature list string unification) {
-  // FIXME update test to match new parser setup
-  record_builder b;
-  auto* l = b.record()->field("l")->list();
-  l->data(0ul);
-  l->data(1.0);
-  l->data("text"s);
-
-  CHECK(b.has_elements());
-  detail::record_builder::signature_type sig;
-  CHECK(not b.append_signature_to(sig, noop_parser));
-
-  detail::record_builder::signature_type expected;
-  {
-    expected.insert(expected.end(),
-                    detail::record_builder::record_start_marker);
-    const auto key_bytes = as_bytes("l"sv);
-    expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
-    expected.insert(expected.end(), detail::record_builder::list_start_marker);
-    expected.insert(
-      expected.end(),
-      static_cast<std::byte>(
-        caf::detail::tl_index_of<field_type_list, std::string>::value));
-    expected.insert(expected.end(), detail::record_builder::list_end_marker);
-    expected.insert(expected.end(), detail::record_builder::record_end_marker);
-  }
+  // fmt::print("{}\n", sig);
+  // fmt::print("{}\n", expected);
   CHECK(sig == expected);
 }
 
@@ -356,6 +358,46 @@ TEST(signature record seeding field not in data) {
   CHECK(sig == expected);
 }
 
+TEST(signature record seeding field not in data --no-extend-schema ) {
+  record_builder b;
+  auto* r = b.record();
+  r->field("0")->data(0ul);
+
+  CHECK(b.has_elements());
+  detail::record_builder::signature_type sig;
+  tenzir::type seed{record_type{
+    {"0", uint64_type{}},
+    {"1", int64_type{}},
+  }};
+  CHECK(not b.append_signature_to(sig, noop_parser, seed, true ));
+
+  detail::record_builder::signature_type expected;
+  {
+    expected.insert(expected.end(),
+                    detail::record_builder::record_start_marker);
+    {
+      const auto key_bytes = as_bytes("0"sv);
+      expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
+      expected.insert(
+        expected.end(),
+        static_cast<std::byte>(
+          caf::detail::tl_index_of<field_type_list, uint64_t>::value));
+    }
+    {
+      const auto key_bytes = as_bytes("1"sv);
+      expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
+      expected.insert(
+        expected.end(),
+        static_cast<std::byte>(
+          caf::detail::tl_index_of<field_type_list, int64_t>::value));
+    }
+    expected.insert(expected.end(), detail::record_builder::record_end_marker);
+  }
+  // fmt::print("{}\n", sig);
+  // fmt::print("{}\n", expected);
+  CHECK(sig == expected);
+}
+
 TEST(signature record seeding data - field not in seed) {
   record_builder b;
   auto* r = b.record();
@@ -391,55 +433,23 @@ TEST(signature record seeding data - field not in seed) {
     }
     expected.insert(expected.end(), detail::record_builder::record_end_marker);
   }
-  fmt::print("{}\n", sig);
-  fmt::print("{}\n", expected);
+  // fmt::print("{}\n", sig);
+  // fmt::print("{}\n", expected);
   CHECK(sig == expected);
 }
 
-// TEST(signature record seeding numeric mismatch) {
-//   // FIXME check that we actually want to unify towards double
-//   record_builder b;
-//   auto* r = b.record();
-//   r->field("0")->data(0ul);
-
-//   CHECK(b.has_elements());
-//   detail::record_builder::signature_type sig;
-//   tenzir::type seed{record_type{
-//     {"0", int64_type{}},
-//   }};
-//   CHECK(not b.append_signature_to(sig, noop_parser, seed));
-
-//   detail::record_builder::signature_type expected;
-//   {
-//     expected.insert(expected.end(),
-//                     detail::record_builder::record_start_marker);
-//     {
-//       const auto key_bytes = as_bytes("0"sv);
-//       expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
-//       expected.insert(
-//         expected.end(),
-//         static_cast<std::byte>(
-//           caf::detail::tl_index_of<field_type_list, double>::value));
-//     }
-//     expected.insert(expected.end(),
-//     detail::record_builder::record_end_marker);
-//   }
-//   //   fmt::print("{}\n", sig);
-//   //   fmt::print("{}\n", expected);
-//   CHECK(sig == expected);
-// }
-
-TEST(overwrite record fields) {
+TEST(signature record seeding data - field not in seed --no-extend-schema) {
   record_builder b;
   auto* r = b.record();
-  r->field("0")->data(0ul);
-  r->field("0")->data(0l);
-  r->field("0")->data(0.0);
+  r->field("1")->data(0l);
   r->field("0")->data(0ul);
 
   CHECK(b.has_elements());
   detail::record_builder::signature_type sig;
-  CHECK(not b.append_signature_to(sig, noop_parser));
+  tenzir::type seed{record_type{
+    {"0", uint64_type{}},
+  }};
+  CHECK(not b.append_signature_to(sig, noop_parser, seed, true));
 
   detail::record_builder::signature_type expected;
   {
@@ -455,10 +465,44 @@ TEST(overwrite record fields) {
     }
     expected.insert(expected.end(), detail::record_builder::record_end_marker);
   }
-  //   fmt::print("{}\n", sig);
-  //   fmt::print("{}\n", expected);
+  // fmt::print("{}\n", sig);
+  // fmt::print("{}\n", expected);
   CHECK(sig == expected);
 }
 
+TEST(signature record seeding numeric mismatch) {
+  record_builder b;
+  auto* r = b.record();
+  r->field("0")->data(0ul);
+
+  CHECK(b.has_elements());
+  detail::record_builder::signature_type sig;
+  tenzir::type seed{record_type{
+    {"0", int64_type{}},
+  }};
+  // a strictly numeric mismatch does not return an error and is just handled by
+  // casting to the seed type
+  CHECK(not b.append_signature_to(sig, noop_parser, seed));
+  // REQUIRE( err );
+  // CHECK( err.code() == static_cast<uint8_t>( ec::type_clash )  );
+
+  detail::record_builder::signature_type expected;
+  {
+    expected.insert(expected.end(),
+                    detail::record_builder::record_start_marker);
+    {
+      const auto key_bytes = as_bytes("0"sv);
+      expected.insert(expected.end(), key_bytes.begin(), key_bytes.end());
+      expected.insert(
+        expected.end(),
+        static_cast<std::byte>(
+          caf::detail::tl_index_of<field_type_list, int64_t>::value));
+    }
+    expected.insert(expected.end(), detail::record_builder::record_end_marker);
+  }
+  // fmt::print("{}\n", sig);
+  // fmt::print("{}\n", expected);
+  CHECK(sig == expected);
+}
 } // namespace
 } // namespace tenzir

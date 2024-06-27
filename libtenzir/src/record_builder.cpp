@@ -12,6 +12,8 @@
 
 #include "tenzir/aliases.hpp"
 #include "tenzir/as_bytes.hpp"
+#include "tenzir/concept/parseable/string/string.hpp"
+#include "tenzir/concept/parseable/tenzir/data.hpp"
 #include "tenzir/data.hpp"
 #include "tenzir/detail/assert.hpp"
 #include "tenzir/detail/overload.hpp"
@@ -76,6 +78,84 @@ auto record_builder::materialize(bool mark_dead) -> tenzir::record {
   root_.commit_to(res, mark_dead);
 
   return res;
+}
+
+template <typename T>
+struct type_to_parser;
+
+template <>
+struct type_to_parser<null_type> : std::type_identity<decltype(parsers::null)> {
+};
+template <>
+struct type_to_parser<bool_type>
+  : std::type_identity<decltype(parsers::boolean)> {};
+template <>
+struct type_to_parser<int64_type>
+  : std::type_identity<decltype(parsers::integer)> {};
+template <>
+struct type_to_parser<uint64_type>
+  : std::type_identity<decltype(parsers::count)> {};
+template <>
+struct type_to_parser<double_type>
+  : std::type_identity<decltype(parsers::real)> {};
+template <>
+struct type_to_parser<duration_type>
+  : std::type_identity<decltype(parsers::duration)> {};
+template <>
+struct type_to_parser<time_type> : std::type_identity<decltype(parsers::time)> {
+};
+template <>
+struct type_to_parser<string_type> : std::type_identity<parsers::str> {};
+template <>
+struct type_to_parser<ip_type> : std::type_identity<decltype(parsers::ip)> {};
+template <>
+struct type_to_parser<subnet_type>
+  : std::type_identity<decltype(parsers::net)> {};
+
+template <typename T>
+concept has_parser = caf::detail::is_complete<type_to_parser<T>>();
+
+auto record_builder::basic_parser(std::string s, tenzir::type* seed)
+  -> caf::expected<tenzir::data> {
+  if (not seed) {
+    tenzir::data result;
+    if (parsers::data(s, result)) {
+      return result;
+    } else {
+      return caf::make_error(
+        ec::parse_error,
+        fmt::format("failed to best-effort parse '{}' as generic data", s));
+    }
+  }
+  const auto visitor = detail::overload{
+    [&s]<has_parser T>(T& t) -> caf::expected<tenzir::data> {
+      type_to_data_t<T> res;
+      using parser = typename type_to_parser<T>::type;
+      if (parser{}(s, res)) {
+        return res;
+      } else {
+        return caf::make_error(
+          ec::parse_error, fmt::format("failed to parse '{}' as '{}'", s, t));
+      }
+    },
+    [&s](record_type&) -> caf::expected<tenzir::data> {
+      TENZIR_ERROR(
+        "record builder basic parser does not support structural types");
+      return caf::make_error(ec::parse_error, "Unexpected seed for parsing");
+    },
+    [&s](list_type&) -> caf::expected<tenzir::data> {
+      TENZIR_ERROR(
+        "record builder basic parser does not support structural types");
+      return caf::make_error(ec::parse_error, "Unexpected seed for parsing");
+    },
+    [](auto&) -> caf::expected<tenzir::data> {
+      TENZIR_ERROR(
+        "record builder basic parser does not support structural types");
+      return caf::make_error(ec::parse_error, "Unexpected seed for parsing");
+    },
+  }; // namespace tenzir
+
+  return caf::visit(visitor, *seed);
 }
 
 namespace detail::record_builder {
@@ -410,6 +490,7 @@ auto node_list::data(tenzir::data d) -> void {
 
 auto node_list::data_unparsed(std::string text) -> void {
   mark_this_alive();
+  type_index_ = type_index_generic_mismatch;
   if (auto* free = find_free()) {
     free->data_unparsed(text);
   } else {
@@ -423,11 +504,10 @@ auto node_list::null() -> void {
 }
 
 void node_list::update_new_structural_signature() {
-  
   if (current_structural_signature_.empty()) {
     current_structural_signature_ = std::move(new_structural_signature_);
   } else if (new_structural_signature_ != current_structural_signature_) {
-    type_index_ = type_index_mismatch;
+    type_index_ = type_index_generic_mismatch;
   }
 }
 
@@ -437,7 +517,8 @@ auto node_list::record() -> node_record* {
     type_index_,
     type_index_record); // FIXME this is not correct, it would need to verify
                         // that the signatures of the elements actually match
-  if (type_index_ != type_index_empty and type_index_ != type_index_mismatch) {
+  if (type_index_ != type_index_empty
+      and type_index_ != type_index_generic_mismatch) {
     update_new_structural_signature();
   }
   if (auto* free = find_free()) {
@@ -503,6 +584,7 @@ auto node_list::reseed(const tenzir::list_type& seed) -> void {
 
 auto node_list::commit_to(builder_ref r, bool mark_dead) -> void {
   if (mark_dead) {
+    type_index_ = type_index_empty;
     mark_this_dead();
   }
   for (auto& v : data_) {
@@ -515,6 +597,7 @@ auto node_list::commit_to(builder_ref r, bool mark_dead) -> void {
 }
 auto node_list::commit_to(tenzir::list& r, bool mark_dead) -> void {
   if (mark_dead) {
+    type_index_ = type_index_empty;
     mark_this_dead();
   }
   for (auto& v : data_) {

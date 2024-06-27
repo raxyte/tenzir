@@ -184,6 +184,9 @@ public:
     std::string default_name = "tenzir.unknown";
     // whether the output should adhere to the input order
     bool ordered = true;
+    // if the given policy finds a schema, only fields from that schema should
+    // be present in the output and extra fields should be discarded
+    bool schema_only = false;
     // timeout after which events will be yielded regardless of whether the
     // desired batch size has been reached
     std::chrono::steady_clock::duration timeout
@@ -192,10 +195,12 @@ public:
     size_t desired_batch_size = defaults::import::table_slice_size;
   };
 
-  multi_series_builder(policy_type policy, settings s,
+  template <detail::record_builder::data_parsing_function Parser>
+  multi_series_builder(policy_type policy, settings s, Parser&& parser,
                        std::vector<type> schemas = {})
     : policy_{std::move(policy)},
       settings_{std::move(s)},
+      parser_{std::forward<Parser>(parser)},
       schemas_{std::move(schemas)} {
     if (auto p = get_policy<policy_merge>()) {
       settings_.ordered = true; // merging mode is necessarily ordered
@@ -278,7 +283,8 @@ private:
 
   policy_type policy_;
   settings settings_;
-  std::function<caf::expected<tenzir::data>(std::string,const tenzir::type*)> parser_;
+  std::function<caf::expected<tenzir::data>(std::string, const tenzir::type*)>
+    parser_;
   std::vector<type> schemas_;
 
   record_builder builder_raw_;

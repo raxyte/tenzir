@@ -30,6 +30,9 @@ namespace tenzir {
 class record_builder;
 namespace detail::record_builder {
 
+// A function used to parse "std::string -> tenzir::data". Used for late parsing
+// raw fields in the record_builder. The string is moved from the record
+// builders internal structure into the parser
 template <typename P>
 concept data_parsing_function
   = requires(P parser, std::string str, const tenzir::type* seed) {
@@ -75,7 +78,80 @@ concept non_structured_data_type
                              enriched_dummy>,
       T>::value;
 
+template <typename T>
+concept numeric_type
+  = non_structured_data_type<T>
+    and (std::same_as<T, uint64_type> or std::same_as<T, int64_type>
+         or std::same_as<T, double_type>);
+
 using signature_type = std::vector<std::byte>;
+
+constexpr static size_t type_index_empty
+  = caf::detail::tl_size<field_type_list>::value;
+constexpr static size_t type_index_numeric_mismatch
+  = caf::detail::tl_size<field_type_list>::value + 1;
+constexpr static size_t type_index_generic_mismatch
+  = caf::detail::tl_size<field_type_list>::value + 2;
+constexpr static size_t type_index_string
+  = caf::detail::tl_index_of<field_type_list, std::string>::value;
+constexpr static size_t type_index_double
+  = caf::detail::tl_index_of<field_type_list, double>::value;
+constexpr static size_t type_index_list
+  = caf::detail::tl_index_of<field_type_list, node_list>::value;
+constexpr static size_t type_index_record
+  = caf::detail::tl_index_of<field_type_list, node_record>::value;
+
+static inline constexpr auto is_structural(size_t idx) -> bool {
+  switch (idx) {
+    case caf::detail::tl_index_of<field_type_list, node_list>::value:
+    case caf::detail::tl_index_of<field_type_list, node_record>::value:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static inline constexpr auto is_numeric(size_t idx) -> bool {
+  switch (idx) {
+    case caf::detail::tl_index_of<field_type_list, int64_t>::value:
+    case caf::detail::tl_index_of<field_type_list, uint64_t>::value:
+    case caf::detail::tl_index_of<field_type_list, double>::value:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static inline auto is_null(size_t idx) -> bool {
+  return idx == caf::detail::tl_index_of<field_type_list, caf::none_t>::value;
+}
+
+static inline auto
+update_type_index(size_t& old_index, size_t new_index) -> void {
+  if (old_index == type_index_generic_mismatch) {
+    return;
+  }
+  if (old_index == new_index) {
+    return;
+  }
+  if (is_null(new_index)) {
+    return;
+  }
+  if (old_index == type_index_empty) {
+    old_index = new_index;
+    return;
+  }
+  if (is_null(old_index)) {
+    old_index = new_index;
+    return;
+  }
+  if ((old_index == type_index_numeric_mismatch or is_numeric(old_index))
+      and is_numeric(new_index)) {
+    old_index = type_index_numeric_mismatch;
+    return;
+  }
+  old_index = type_index_generic_mismatch;
+}
 
 enum class state { alive, sentinel, dead };
 
@@ -119,6 +195,12 @@ public:
   /// @ref reserve can be used to ensure stability for a given number of elements
   [[nodiscard]] auto field(std::string_view name) -> node_field*;
 
+  /// parses any unparsed fields using `parser`, potentially providing a
+  /// seed/schema to the parser
+  template <data_parsing_function Parser>
+  auto parse(Parser& parser, const tenzir::record_type* seed,
+             bool schema_only) -> caf::error;
+
 private:
   // tries to get a field with the given name. Does not affect any field state
   auto try_field(std::string_view name) -> node_field*;
@@ -133,9 +215,9 @@ private:
   // append the signature of this record to `sig`.
   // including sentinels is important for signature computation
   template <data_parsing_function Parser>
-  auto
-  append_to_signature(signature_type& sig, Parser& p,
-                      const tenzir::record_type* seed = nullptr) -> caf::error;
+  auto append_to_signature(signature_type& sig, Parser& p,
+                           const tenzir::record_type* seed,
+                           bool schema_only) -> caf::error;
   // clears the record by marking everything as dead
   auto clear() -> void;
 
@@ -186,6 +268,16 @@ public:
   /// @ref reserve can be used to ensure stability for a given number of elements
   [[nodiscard]] auto list() -> node_list*;
 
+  /// parses any unparsed fields using `parser`, potentially providing a
+  /// seed/schema to the parser
+  template <data_parsing_function Parser>
+  auto parse(Parser& parser, const tenzir::list_type* seed,
+             bool schema_only) -> caf::error;
+
+  auto combined_index() const -> size_t {
+    return type_index_;
+  }
+
 private:
   /// finds an element marked as dead. This is part of the reallocation
   /// optimization.
@@ -203,12 +295,12 @@ private:
   // append the signature of this list to `sig`.
   // including sentinels is important for signature computation
   template <data_parsing_function Parser>
-  auto
-  append_to_signature(signature_type& sig, Parser& p,
-                      const tenzir::list_type* seed = nullptr) -> caf::error;
+  auto append_to_signature(signature_type& sig, Parser& p,
+                           const tenzir::list_type* seed,
+                           bool schema_only) -> caf::error;
   auto clear() -> void;
 
-  size_t type_index_;
+  size_t type_index_ = type_index_empty;
   signature_type current_structural_signature_;
   signature_type new_structural_signature_;
   std::vector<node_field> data_;
@@ -249,17 +341,37 @@ private:
   auto get_if() -> T* {
     return std::get_if<T>(&data_);
   }
+  /// tries to static_cast the held value to T.
+  /// @returns whether the cast was performed
+  template <typename T>
+  auto cast_to() -> bool {
+    const auto visitor = detail::overload{
+      [this]<typename Current>(const Current& v) -> bool
+        requires requires(Current c) { static_cast<T>(c); }
+      {
+        data(static_cast<T>(v));
+        return true;
+      },
+      [](const auto&) -> bool {
+        return false;
+      },
+      };
+    return std::visit(visitor, data_);
+  }
   // (re-)seeds the field to match the given type. If the field is alive, this
   // has no effect
   auto reseed(const tenzir::type&) -> void;
-  // parses the current un-parsed value if any
+  /// parses any unparsed fields using `parser`, potentially providing a
+  /// seed/schema to the parser
   template <data_parsing_function Parser>
-  auto parse(Parser&, const tenzir::type* seed) -> caf::error;
+  auto parse(Parser& parser, const tenzir::type* seed,
+             bool schema_only) -> caf::error;
   // append the signature of this field to `sig`.
   // including sentinels is important for signature computation
   template <data_parsing_function Parser>
-  auto append_to_signature(signature_type& sig, Parser& p,
-                           const tenzir::type* seed = nullptr) -> caf::error;
+  auto
+  append_to_signature(signature_type& sig, Parser& p, const tenzir::type* seed,
+                      bool schema_only) -> caf::error;
   // writes the field into a series builder
   auto commit_to(tenzir::builder_ref r, bool mark_dead = true) -> void;
   auto commit_to(tenzir::data& r, bool mark_dead = true) -> void;
@@ -321,9 +433,9 @@ public:
   using signature_type = typename detail::record_builder::signature_type;
   /// computes the "signature" of the currently built record.
   template <detail::record_builder::data_parsing_function Parser>
-  auto append_signature_to(signature_type&, Parser& p,
-                           std::optional<tenzir::type> seed
-                           = std::nullopt) -> caf::error;
+  auto append_signature_to(signature_type&, Parser&& p,
+                           std::optional<tenzir::type> seed = std::nullopt,
+                           bool schema_only = false) -> caf::error;
 
   /// clears the builder
   void clear();
@@ -336,6 +448,17 @@ public:
   /// commits the current record into the series builder
   /// @param mark_dead whether to mark nodes in the record builder as dead
   auto commit_to(series_builder&, bool mark_dead = true) -> void;
+
+  /// a very basic parser that simply uses `tenzir::parsers` under the hood
+  /// this parser does not support the seed pointing to a structural type
+  static auto basic_parser(std::string s,
+                           tenzir::type* seed) -> caf::expected<tenzir::data>;
+
+  /// parses any unparsed fields using `parser`, potentially providing a
+  /// seed/schema to the parser
+  template <detail::record_builder::data_parsing_function Parser>
+  auto parse(Parser&& parser, const tenzir::type* seed,
+             bool schema_only) -> caf::error;
 
 private:
   detail::record_builder::node_record root_;
@@ -350,30 +473,61 @@ auto record_builder::find_value_typed(std::string_view key) -> T* {
 }
 
 template <detail::record_builder::data_parsing_function Parser>
-auto record_builder::append_signature_to(signature_type& sig, Parser& p,
-                                         std::optional<tenzir::type> seed)
-  -> caf::error {
+auto record_builder::append_signature_to(signature_type& sig, Parser&& p,
+                                         std::optional<tenzir::type> seed,
+                                         bool schema_only) -> caf::error {
+  auto seed_error = caf::error{};
+  auto* seed_as_record_type = caf::get_if<tenzir::record_type>(&*seed);
   if (seed) {
-    auto* seed_as_record_type = caf::get_if<tenzir::record_type>(&*seed);
-    TENZIR_ASSERT(seed_as_record_type);
-    return root_.append_to_signature(sig, p, seed_as_record_type);
+    if (seed_as_record_type) {
+      return root_.append_to_signature(sig, p, seed_as_record_type,
+                                       schema_only);
+    } else {
+      seed_error = caf::make_error(
+        ec::parse_error, "selected schema is not a record and will be ignored");
+    }
   }
-  return root_.append_to_signature(sig, p);
+  auto plain_error = root_.append_to_signature(sig, p, nullptr, schema_only);
+  if (not plain_error and seed_error) {
+    if (seed_error) {
+      return seed_error;
+    }
+  }
+  return plain_error;
+}
+
+template <detail::record_builder::data_parsing_function Parser>
+auto record_builder::parse(Parser&& p, const tenzir::type* seed,
+                           bool schema_only) -> caf::error {
+  auto err = caf::error{};
+  if (seed) {
+    if (auto seed_as_record = caf::get_if<tenzir::record_type>(&*seed)) {
+      return root_.parse(p, seed_as_record, schema_only);
+    } else {
+      err = caf::make_error(ec::type_clash, "schema is not a record");
+    }
+  }
+  auto res = root_.parse(p, seed, schema_only);
+  if (res) {
+    return res;
+  }
+  return err;
 }
 
 namespace detail::record_builder {
+
 template <data_parsing_function Parser>
 auto node_record::append_to_signature(signature_type& sig, Parser& p,
-                                      const tenzir::record_type* seed)
-  -> caf::error {
+                                      const tenzir::record_type* seed,
+                                      bool schema_only) -> caf::error {
   sig.push_back(record_start_marker);
-
   // if we have a seed, we need too ensure that all fields exist first
   if (seed) {
     for (const auto& [k, v] : seed->fields()) {
       try_field(k)->mark_this_relevant();
     }
   }
+  auto err = caf::error{};
   // we are intentionally traversing `lookup_` here, because that is sorted by
   // name. this ensures that the signature computation will be the same
   for (const auto& [k, index] : lookup_) {
@@ -390,9 +544,9 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
             handled_by_seed = true;
             const auto key_bytes = as_bytes(k);
             sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
-            auto e = field.append_to_signature(sig, p, &seed_type);
-            if (e) {
-              return e;
+            auto e = field.append_to_signature(sig, p, &seed_type, schema_only);
+            if (e and not err) {
+              err = std::move(e);
             }
             break;
           }
@@ -400,17 +554,55 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
         if (handled_by_seed) {
           continue;
         }
+        if (schema_only) {
+          field.mark_this_dead();
+          continue;
+        }
       }
       const auto key_bytes = as_bytes(k);
       sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
-      auto e = field.append_to_signature(sig, p);
-      if (e) {
-        return e;
+      auto e = field.append_to_signature(sig, p, nullptr, schema_only);
+      if (e and not err) {
+        err = std::move(e);
       }
     }
   }
   sig.push_back(record_end_marker);
-  return {};
+  return err;
+}
+
+template <data_parsing_function Parser>
+auto node_record::parse(Parser& p, const tenzir::record_type* seed,
+                        bool schema_only) -> caf::error {
+  auto err = caf::error{};
+  for (auto& [key, value] : data_) {
+    if (value.is_alive()) {
+      bool handled_by_seed = false;
+      if (seed) {
+        for (auto [seed_key, seed_type] : seed->fields()) {
+          if (seed_key == key) {
+            handled_by_seed = true;
+            auto e = value.parse(p, &seed_type);
+            if (e and not err) {
+              err = std::move(e);
+            }
+            break;
+          }
+        }
+        if (schema_only) {
+          value.state_ = state::sentinel;
+          handled_by_seed = true;
+        }
+      }
+      if (not handled_by_seed) {
+        auto e = value.parse(p, seed);
+        if (e and not err) {
+          err = std::move(e);
+        }
+      }
+    }
+  }
+  return err;
 }
 
 template <non_structured_data_type T>
@@ -421,7 +613,8 @@ auto node_field::data(T data) -> void {
 }
 
 template <data_parsing_function Parser>
-auto node_field::parse(Parser& p, const tenzir::type* seed) -> caf::error {
+auto node_field::parse(Parser& p, const tenzir::type* seed,
+                       bool schema_only) -> caf::error {
   if (not is_raw_) {
     return {};
   }
@@ -429,6 +622,10 @@ auto node_field::parse(Parser& p, const tenzir::type* seed) -> caf::error {
   std::string& raw = std::get<std::string>(data_);
   auto res = p(std::move(raw), seed);
   if (res) {
+    if (schema_only and seed
+        and res->get_data().index() != seed->type_index()) {
+      return {};
+    }
     data(*res);
     return {};
   }
@@ -437,46 +634,57 @@ auto node_field::parse(Parser& p, const tenzir::type* seed) -> caf::error {
 
 template <data_parsing_function Parser>
 auto node_field::append_to_signature(signature_type& sig, Parser& p,
-                                     const tenzir::type* seed) -> caf::error {
+                                     const tenzir::type* seed,
+                                     bool schema_only) -> caf::error {
   if (is_raw_) {
-    auto e = parse(p, seed);
+    auto e = parse(p, seed, schema_only);
     if (e != caf::error{}) {
       return e;
     }
   }
   const auto visitor = detail::overload{
-    [&sig, &p, seed](node_list& v) {
+    [&sig, &p, seed, schema_only](node_list& v) {
       const auto* ls = caf::get_if<list_type>(seed);
+      auto seed_error = caf::error{};
       if (seed and not ls) {
-        return caf::make_error(ec::type_clash,
-                               "field holds list but seed is not a list");
+        seed_error
+          = caf::make_error(ec::type_clash, "event field is a list, but the "
+                                            "schema does not expect a list");
       }
       if (v.affects_signature() or ls) {
-        return v.append_to_signature(sig, p, ls);
+        auto sig_error = v.append_to_signature(sig, p, ls, schema_only);
+        if (sig_error) {
+          return sig_error;
+        }
       }
-      return caf::error{};
+      return seed_error;
     },
-    [&sig, &p, seed](node_record& v) {
+    [&sig, &p, seed, schema_only](node_record& v) {
       const auto* rs = caf::get_if<record_type>(seed);
+      auto seed_error = caf::error{};
       if (seed and not rs) {
-        return caf::make_error(ec::type_clash,
-                               "field holds record but seed is not a record");
+        seed_error
+          = caf::make_error(ec::type_clash, "event field is a record, but the "
+                                            "schema does not expect a record");
       }
       if (v.affects_signature() or rs) {
-        return v.append_to_signature(sig, p, rs);
+        auto sig_error = v.append_to_signature(sig, p, rs, schema_only);
+        if (sig_error) {
+          return sig_error;
+        }
       }
-      return caf::error{};
+      return seed_error;
     },
-    [&sig, p, seed, this](caf::none_t&) {
+    [&sig, p, seed, this, schema_only](caf::none_t&) {
       // none could be the result of pre-seeding or being built with a true null
       // via the API for the first case we need to ensure we continue doing
-      // seeing if we have a seed
+      // seeding if we have a seed
       if (seed) {
         if (auto sr = caf::get_if<tenzir::record_type>(seed)) {
-          return record()->append_to_signature(sig, p, sr);
+          return record()->append_to_signature(sig, p, sr, schema_only);
         }
         if (auto sl = caf::get_if<tenzir::list_type>(seed)) {
-          return list()->append_to_signature(sig, p, sl);
+          return list()->append_to_signature(sig, p, sl, schema_only);
         }
         sig.push_back(static_cast<std::byte>(seed->type_index()));
         return caf::error{};
@@ -487,17 +695,62 @@ auto node_field::append_to_signature(signature_type& sig, Parser& p,
         return caf::error{};
       }
     },
-    [&sig, seed]<non_structured_data_type T>(T&) {
-      size_t type_idx = caf::detail::tl_index_of<field_type_list, T>::value;
+    [&sig, seed, this]<non_structured_data_type T>(T& v) {
+      constexpr static auto type_idx
+        = caf::detail::tl_index_of<field_type_list, T>::value;
+      auto result_index = type_idx;
+      auto seed_error = caf::error{};
       if (seed and type_idx != seed->type_index()) {
-        // FIXME are there cases where we may want to still reconcile this?
-        // technically if we run into this case, its an issue of the calling
-        // parsers implementation, which did early parsing before knowing a seed
-        return caf::make_error(ec::type_clash, "type mismatch between parsed "
-                                               "event and selected schema");
+        const auto seed_idx = seed->type_index();
+        if constexpr (is_numeric(type_idx)) {
+          // numeric conversion if possible
+          if (is_numeric(seed_idx)) {
+            switch (seed_idx) {
+              case caf::detail::tl_index_of<field_type_list, int64_t>::value:
+                data(static_cast<int64_t>(v));
+                result_index
+                  = caf::detail::tl_index_of<field_type_list, int64_t>::value;
+                goto done;
+              case caf::detail::tl_index_of<field_type_list, uint64_t>::value:
+                data(static_cast<uint64_t>(v));
+                result_index
+                  = caf::detail::tl_index_of<field_type_list, uint64_t>::value;
+                goto done;
+              case caf::detail::tl_index_of<field_type_list, double>::value:
+                data(static_cast<double>(v));
+                result_index
+                  = caf::detail::tl_index_of<field_type_list, double>::value;
+                goto done;
+              default:
+                TENZIR_UNREACHABLE();
+            }
+          }
+        }
+        if (seed_idx == type_index_string) {
+          // stringify if possible
+          if constexpr (fmt::is_formattable<T>{}) {
+            data(fmt::format("{}", v));
+            seed_error = caf::make_error(
+              ec::type_clash,
+              "The provided schema requested a string, but the parsed field "
+              "was typed data"
+              "This is most likely a shortcoming of the parser");
+          } else {
+            seed_error = caf::make_error(ec::type_clash,
+                                         "parsed field type does not match the "
+                                         "type from the schema. This is most "
+                                         "likely a shortcoming of the parser");
+          }
+        } else {
+          seed_error = caf::make_error(ec::type_clash,
+                                       "parsed field type does not match the "
+                                       "type from the schema. This is most "
+                                       "likely a shortcoming of the parser");
+        }
       }
-      sig.push_back(static_cast<std::byte>(type_idx));
-      return caf::error{};
+    [[maybe_unused]] done:
+      sig.push_back(static_cast<std::byte>(result_index));
+      return seed_error;
     },
     [](auto&) {
       TENZIR_UNREACHABLE();
@@ -505,51 +758,6 @@ auto node_field::append_to_signature(signature_type& sig, Parser& p,
     },
   };
   return std::visit(visitor, data_);
-}
-
-static inline auto is_structural(size_t idx) -> bool {
-  switch (idx) {
-    case caf::detail::tl_index_of<field_type_list, node_list>::value:
-    case caf::detail::tl_index_of<field_type_list, node_record>::value:
-      return true;
-    default:
-      return false;
-  }
-}
-
-constexpr static size_t type_index_empty
-  = caf::detail::tl_size<field_type_list>::value;
-  constexpr static size_t type_index_mismatch
-  = caf::detail::tl_size<field_type_list>::value + 1;
-constexpr static size_t type_index_list
-  = caf::detail::tl_index_of<field_type_list, node_list>::value;
-constexpr static size_t type_index_record
-  = caf::detail::tl_index_of<field_type_list, node_record>::value;
-
-static inline auto is_null(size_t idx) -> bool {
-  return idx == caf::detail::tl_index_of<field_type_list, caf::none_t>::value;
-}
-
-static inline auto
-update_type_index(size_t& old_index, size_t new_index) -> void {
-  if ( old_index == type_index_mismatch ) {
-    return;
-  }
-  if (old_index == new_index) {
-    return;
-  }
-  if (is_null(new_index)) {
-    return;
-  }
-  if (old_index == type_index_empty) {
-    old_index = new_index;
-    return;
-  }
-  if (is_null(old_index)) {
-    old_index = new_index;
-    return;
-  }
-  old_index = type_index_mismatch;
 }
 
 template <non_structured_data_type T>
@@ -566,29 +774,107 @@ auto node_list::data(T data) -> void {
 }
 
 template <data_parsing_function Parser>
-auto node_list::append_to_signature(
-  signature_type& sig, Parser& p, const tenzir::list_type* seed) -> caf::error {
+auto node_list::append_to_signature(signature_type& sig, Parser& p,
+                                    const tenzir::list_type* seed,
+                                    bool schema_only) -> caf::error {
+  auto err = caf::error{};
   sig.push_back(list_start_marker);
-  if (data_.empty() and not seed) {
-    ; // noop
-  }
-  else if ( type_index_ == type_index_mismatch ) {
-    // FIXME implement manual type inference
-  }
-  else if ( is_structural(type_index_)) {
+  if (is_numeric(type_index_) or type_index_ == type_index_numeric_mismatch) {
+    // first, we handle the case where the current index is numeric
+    // this has special handling, as it will try to convert to the seed type or
+    // to double.
+    size_t result_index = type_index_;
     if (seed) {
-      const auto s = seed->value_type();
-      auto e = data_.front().append_to_signature(sig, p, &s);
-      if ( e ) {
-        return e;
+      auto seed_idx = seed->value_type().type_index();
+      if (seed_idx != type_index_) {
+        if (seed_idx == type_index_double) {
+          err = caf::make_error(ec::type_clash,
+                                "numeric type mismatch between list elements "
+                                "and the selected schema. A conversion to "
+                                "'double' will be performed");
+          goto numeric_mismatch_handling;
+        } else {
+          goto generic_mismatch_handling;
+        }
+      }
+    } else if (type_index_ == type_index_numeric_mismatch) {
+    numeric_mismatch_handling:
+      for (auto& e : data_) {
+        e.cast_to<double>();
+      }
+      result_index = type_index_double;
+    }
+    sig.push_back(static_cast<std::byte>(result_index));
+  } else if (is_structural(type_index_)
+             or type_index_ == type_index_generic_mismatch) {
+  generic_mismatch_handling:
+    // this  case also applies when there is any unparsed fields
+    // in the generic "mismatch" handling, we need to iterate every element of
+    // the list we first append an elements signature, and then check if its
+    // identical to the last one we already appended this ensures that if all
+    // elements truly have the same signature, the element count of the list no
+    // longer matters.
+    // Since we need to iterate all elements in the structural case anyways, its
+    // equivalent to the generic mismatch case.
+    tenzir::type seed_type;
+    tenzir::type* seed_type_ptr = nullptr;
+    if (seed) {
+      seed_type = seed->value_type();
+      seed_type_ptr = &seed_type;
+    }
+    auto last_sig_index = 0;
+    for (auto& v : data_) {
+      auto next_sig_index = sig.size();
+      auto element_error
+        = v.append_to_signature(sig, p, seed_type_ptr, schema_only);
+      if (element_error and not err) {
+        // we can only catch one error here, so we catch the first one.
+        // all subsequent errors are most likely going to be repeats of the same
+        // type mismatch - if any
+        err = std::move(element_error);
+      }
+      if (last_sig_index != 0) {
+        const auto last_signatures_match = std::ranges::equal(
+          std::span{sig.begin() + last_sig_index, sig.begin() + next_sig_index},
+          std::span{sig.begin() + next_sig_index, sig.end()});
+        if (last_signatures_match) {
+          // drop the last appended signature
+          sig.erase(sig.begin() + last_sig_index, sig.end());
+        }
+        last_sig_index = next_sig_index;
+      }
+    }
+    // err = caf::make_error(ec::type_clash, "list element type mismatch");
+    // if (seed) {
+
+    // }
+  } else {
+    // finally the happy case where our predetermined index is usable (its not
+    // structural and not a mismatch index)
+    sig.push_back(static_cast<std::byte>(type_index_));
+  }
+  // done:
+  sig.push_back(list_end_marker);
+  return err;
+}
+
+template <data_parsing_function Parser>
+auto node_list::parse(Parser& p, const tenzir::list_type* seed,
+                      bool schema_only) -> caf::error {
+  auto err = caf::error{};
+  auto seed_type = tenzir::type{};
+  if (seed) {
+    auto seed_type = seed->value_type();
+  }
+  for (auto& element : data_) {
+    if (element.is_alive()) {
+      auto e = element.parse(p, seed ? &seed_type : nullptr, schema_only);
+      if (e and not err) {
+        err = std::move(e);
       }
     }
   }
-  else {
-    sig.push_back(static_cast<std::byte>(type_index_));
-  }
-  sig.push_back(list_end_marker);
-  return {};
+  return err;
 }
 } // namespace detail::record_builder
 } // namespace tenzir

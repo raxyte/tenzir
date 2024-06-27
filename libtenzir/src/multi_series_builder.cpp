@@ -190,7 +190,7 @@ void multi_series_builder::complete_last_event() {
   append_name_to_signature(schema_name, signature_raw_);
   const auto schema_type = type_for_schema(schema_name);
   auto e
-    = builder_raw_.append_signature_to(signature_raw_, parser_, schema_type);
+    = builder_raw_.append_signature_to(signature_raw_, parser_, schema_type, settings_.schema_only );
   if (e) {
     errors_.push_back(std::move(e));
     signature_raw_.clear();
