@@ -152,6 +152,7 @@ public:
 
   // this policy will merge all events into a single schema
   struct policy_merge {
+    static constexpr std::string_view name = "merge";
     // whether to reset/clear the schema on yield
     bool reset_on_yield = false;
     // a schema name to seed with. If this is given
@@ -159,7 +160,8 @@ public:
   };
 
   // this policy will keep all schemas in separate batches
-  struct policy_default {
+  struct policy_precise {
+    static constexpr std::string_view name = "precise";
     // If this is given, all resulting events will have exactly this schema
     // * all fields in the schema but not in the event will be null
     std::optional<std::string> seed_schema = {};
@@ -167,6 +169,7 @@ public:
 
   // this policy will keep all schemas in batches according to selector
   struct policy_selector {
+    static constexpr std::string_view name = "selector";
     // the field name to use for selection
     std::string field_name;
     // a naming prefix, doing the following transformation on the name:
@@ -177,7 +180,7 @@ public:
   };
 
   using policy_type
-    = std::variant<policy_merge, policy_default, policy_selector>;
+    = std::variant<policy_merge, policy_precise, policy_selector>;
 
   struct settings {
     // the default name given to a schema
@@ -189,8 +192,7 @@ public:
     bool schema_only = false;
     // timeout after which events will be yielded regardless of whether the
     // desired batch size has been reached
-    std::chrono::steady_clock::duration timeout
-      = defaults::import::batch_timeout;
+    duration timeout = defaults::import::batch_timeout;
     // batch size after which the events should be yielded
     size_t desired_batch_size = defaults::import::table_slice_size;
   };
@@ -271,6 +273,8 @@ private:
   void make_events_available_where(std::predicate<const entry_data&> auto pred);
 
   /// appends `new_events` to `ready_events_`
+  /// TODO Improvement: The series builder could take in a vector instead of
+  /// returning one from flush()
   void append_ready_events(std::vector<series>&& new_events);
 
   /// GCs `series_builders` from `entries_` that satisfy the predicate

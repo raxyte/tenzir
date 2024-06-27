@@ -9,9 +9,6 @@
 #include "tenzir/record_builder.hpp"
 
 #include "tenzir/aliases.hpp"
-#include "tenzir/concept/printable/to.hpp"
-#include "tenzir/concept/printable/to_string.hpp"
-#include "tenzir/detail/assert.hpp"
 #include "tenzir/test/test.hpp"
 #include "tenzir/type.hpp"
 

@@ -6,15 +6,11 @@
 // SPDX-FileCopyrightText: (c) 2024 The Tenzir Contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "tenzir/aliases.hpp"
 #include "tenzir/data.hpp"
 #include "tenzir/detail/assert.hpp"
-#include "tenzir/modules.hpp"
 #include "tenzir/record_builder.hpp"
 #include "tenzir/series_builder.hpp"
-#include "tenzir/try.hpp"
 #include "tenzir/type.hpp"
-#include "tenzir/view.hpp"
 
 #include <tenzir/multi_series_builder.hpp>
 
@@ -23,7 +19,6 @@
 #include <fmt/core.h>
 
 #include <http_parser.h>
-#include <memory>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -178,7 +173,7 @@ void multi_series_builder::complete_last_event() {
         schema_name = *selected_schema;
       }
     }
-  } else if (auto p = get_policy<policy_default>()) {
+  } else if (auto p = get_policy<policy_precise>()) {
     if (p->seed_schema) {
       schema_name = *(p->seed_schema);
     }
