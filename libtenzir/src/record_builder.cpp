@@ -111,7 +111,7 @@ struct type_to_parser<subnet_type>
 template <typename T>
 concept has_parser = caf::detail::is_complete<type_to_parser<T>>();
 
-auto record_builder::basic_parser(std::string s, tenzir::type* seed)
+auto record_builder::basic_parser(std::string s, const tenzir::type* seed)
   -> caf::expected<tenzir::data> {
   if (not seed) {
     tenzir::data result;
@@ -252,9 +252,10 @@ auto node_record::commit_to(record_ref r, bool mark_dead) -> void {
     mark_this_dead();
   }
   for (auto& [k, v] : data_) {
-    if (v.is_alive()) {
-      v.commit_to(r.field(k), mark_dead);
+    if (not v.is_alive()) {
+      continue;
     }
+    v.commit_to(r.field(k), mark_dead);
   }
 }
 

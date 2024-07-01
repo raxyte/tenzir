@@ -19,7 +19,6 @@
 #include <caf/expected.hpp>
 
 #include <cstddef>
-#include <iostream>
 #include <string>
 #include <utility>
 #include <variant>
@@ -434,7 +433,7 @@ public:
   /// computes the "signature" of the currently built record.
   template <detail::record_builder::data_parsing_function Parser>
   auto append_signature_to(signature_type&, Parser&& p,
-                           std::optional<tenzir::type> seed = std::nullopt,
+                           const tenzir::type* seed = nullptr,
                            bool schema_only = false) -> caf::error;
 
   /// clears the builder
@@ -451,8 +450,9 @@ public:
 
   /// a very basic parser that simply uses `tenzir::parsers` under the hood
   /// this parser does not support the seed pointing to a structural type
-  static auto basic_parser(std::string s,
-                           tenzir::type* seed) -> caf::expected<tenzir::data>;
+  static auto
+  basic_parser(std::string s,
+               const tenzir::type* seed) -> caf::expected<tenzir::data>;
 
   /// parses any unparsed fields using `parser`, potentially providing a
   /// seed/schema to the parser
@@ -474,7 +474,7 @@ auto record_builder::find_value_typed(std::string_view key) -> T* {
 
 template <detail::record_builder::data_parsing_function Parser>
 auto record_builder::append_signature_to(signature_type& sig, Parser&& p,
-                                         std::optional<tenzir::type> seed,
+                                         const tenzir::type* seed,
                                          bool schema_only) -> caf::error {
   auto seed_error = caf::error{};
   auto* seed_as_record_type = caf::get_if<tenzir::record_type>(&*seed);
@@ -524,7 +524,8 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
   // if we have a seed, we need too ensure that all fields exist first
   if (seed) {
     for (const auto& [k, v] : seed->fields()) {
-      try_field(k)->mark_this_relevant();
+      auto* ptr = try_field(k);
+      ptr->mark_this_relevant();
     }
   }
   auto err = caf::error{};
@@ -539,7 +540,7 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
         // find the type for a field with a given name
         // a non-generator based API to get these would be ideal, so
         // we dont have to iterate for every key
-        for (auto [seed_key, seed_type] : seed->fields()) {
+        for (const auto& [seed_key, seed_type] : seed->fields()) {
           if (seed_key == k) {
             handled_by_seed = true;
             const auto key_bytes = as_bytes(k);
@@ -595,7 +596,7 @@ auto node_record::parse(Parser& p, const tenzir::record_type* seed,
         }
       }
       if (not handled_by_seed) {
-        auto e = value.parse(p, seed);
+        auto e = value.parse(p, nullptr);
         if (e and not err) {
           err = std::move(e);
         }
@@ -618,15 +619,22 @@ auto node_field::parse(Parser& p, const tenzir::type* seed,
   if (not is_raw_) {
     return {};
   }
+  if (not is_alive()) {
+    return {};
+  }
   TENZIR_ASSERT(std::holds_alternative<std::string>(data_));
   std::string& raw = std::get<std::string>(data_);
   auto res = p(std::move(raw), seed);
   if (res) {
     if (schema_only and seed
         and res->get_data().index() != seed->type_index()) {
-      return {};
+      // if schema only is enabled, and the parsed field does not match the
+      // schema, we discard its value
+      return caf::make_error(ec::type_clash, "late parsed fields type does not "
+                                             "match the provided schema. This "
+                                             "is a shortcoming of the parser.");
     }
-    data(*res);
+    data(std::move(*res));
     return {};
   }
   return res.error();
@@ -636,11 +644,21 @@ template <data_parsing_function Parser>
 auto node_field::append_to_signature(signature_type& sig, Parser& p,
                                      const tenzir::type* seed,
                                      bool schema_only) -> caf::error {
+  auto res = caf::error{};
   if (is_raw_) {
-    auto e = parse(p, seed, schema_only);
-    if (e != caf::error{}) {
-      return e;
+    res = parse(p, seed, schema_only);
+  }
+  if (state_ == state::sentinel) {
+    if (not seed) {
+      return {};
     }
+    const auto seed_idx = seed->type_index();
+    if (not is_structural(seed_idx)) {
+      sig.push_back(static_cast<std::byte>(seed_idx));
+
+      return {};
+    }
+    // sentinel structural types get handled by the regular visit below
   }
   const auto visitor = detail::overload{
     [&sig, &p, seed, schema_only](node_list& v) {
@@ -730,23 +748,21 @@ auto node_field::append_to_signature(signature_type& sig, Parser& p,
           // stringify if possible
           if constexpr (fmt::is_formattable<T>{}) {
             data(fmt::format("{}", v));
+            result_index = type_index_string;
             seed_error = caf::make_error(
               ec::type_clash,
               "The provided schema requested a string, but the parsed field "
               "was typed data"
               "This is most likely a shortcoming of the parser");
-          } else {
-            seed_error = caf::make_error(ec::type_clash,
-                                         "parsed field type does not match the "
-                                         "type from the schema. This is most "
-                                         "likely a shortcoming of the parser");
           }
-        } else {
-          seed_error = caf::make_error(ec::type_clash,
-                                       "parsed field type does not match the "
-                                       "type from the schema. This is most "
-                                       "likely a shortcoming of the parser");
         }
+
+        seed_error
+          = caf::make_error(ec::type_clash,
+                            "parsed field type (id: {}), does not match the "
+                            "type from the schema (id: {}). This is most "
+                            "likely a shortcoming of the parser",
+                            type_idx, seed_idx);
       }
     [[maybe_unused]] done:
       sig.push_back(static_cast<std::byte>(result_index));
@@ -757,7 +773,11 @@ auto node_field::append_to_signature(signature_type& sig, Parser& p,
       return caf::make_error(ec::unimplemented);
     },
   };
-  return std::visit(visitor, data_);
+  auto sig_error = std::visit(visitor, data_);
+  if (sig_error and not res) {
+    return sig_error;
+  }
+  return res;
 }
 
 template <non_structured_data_type T>
