@@ -555,10 +555,10 @@ TEST(selector unordered) {
     },
   };
 
-  fmt::print("res:\n");
-  print(res);
-  fmt::print("exp:\n");
-  print(expected_result);
+  // fmt::print("res:\n");
+  // print(res);
+  // fmt::print("exp:\n");
+  // print(expected_result);
   check_outcome(res, expected_result);
 }
 
@@ -639,10 +639,10 @@ TEST(selector unordered schema_only) {
     },
   };
 
-  fmt::print("res:\n");
-  print(res);
-  fmt::print("exp:\n");
-  print(expected_result);
+  // fmt::print("res:\n");
+  // print(res);
+  // fmt::print("exp:\n");
+  // print(expected_result);
   check_outcome(res, expected_result);
 }
 
