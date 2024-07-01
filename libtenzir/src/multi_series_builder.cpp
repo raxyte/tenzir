@@ -135,7 +135,7 @@ void multi_series_builder::remove_last() {
     builder_raw_.clear();
     return;
   }
-  if (active_index_ != invalid_index) {
+  if (active_index_ < entries_.size()) {
     entries_[active_index_].builder.remove_last();
   }
 }
@@ -162,6 +162,7 @@ void multi_series_builder::complete_last_event() {
   if (not builder_raw_.has_elements()) {
     return; // an empty raw field does not need to be written back
   }
+  auto r = builder_raw_.materialize(false);
   std::string schema_name;
   if (auto p = get_policy<policy_selector>()) {
     auto* selected_schema
@@ -184,13 +185,11 @@ void multi_series_builder::complete_last_event() {
   signature_raw_.clear();
   append_name_to_signature(schema_name, signature_raw_);
   const auto schema_type = type_for_schema(schema_name);
-  auto e
-    = builder_raw_.append_signature_to(signature_raw_, parser_, schema_type, settings_.schema_only );
+  auto e = builder_raw_.append_signature_to(signature_raw_, parser_,
+                                            schema_type, settings_.schema_only);
   if (e) {
     errors_.push_back(std::move(e));
-    signature_raw_.clear();
-    builder_raw_.clear();
-    return;
+    //TODO re-consider what to do with an errored event 
   }
   auto free_index = next_free_index();
   auto [it, inserted] = signature_map_.try_emplace(
@@ -211,7 +210,7 @@ void multi_series_builder::complete_last_event() {
   }
   active_index_ = new_index;
   auto& entry = entries_[new_index];
-  builder_raw_.commit_to(entry.builder);
+  builder_raw_.commit_to(entry.builder, true);
 }
 
 void multi_series_builder::clear_raw_event() {
@@ -229,15 +228,14 @@ std::optional<size_t> multi_series_builder::next_free_index() const {
 }
 
 auto multi_series_builder::type_for_schema(std::string_view name)
-  -> std::optional<std::reference_wrapper<const type>> {
+  -> const tenzir::type* {
   const auto it = std::ranges::find(schemas_, name, [](const tenzir::type& t) {
     return t.name();
   });
-
   if (it == std::ranges::end(schemas_)) {
-    return std::nullopt;
+    return nullptr;
   } else {
-    return *it;
+    return &*it;
   }
 }
 

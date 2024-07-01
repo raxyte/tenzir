@@ -151,6 +151,7 @@ public:
   auto finalize() -> std::vector<series>;
 
   // this policy will merge all events into a single schema
+  // FIXME this does not correctly support --schema-only yet
   struct policy_merge {
     static constexpr std::string_view name = "merge";
     // whether to reset/clear the schema on yield
@@ -182,7 +183,7 @@ public:
   using policy_type
     = std::variant<policy_merge, policy_precise, policy_selector>;
 
-  struct settings {
+  struct settings_type {
     // the default name given to a schema
     std::string default_name = "tenzir.unknown";
     // whether the output should adhere to the input order
@@ -198,10 +199,10 @@ public:
   };
 
   template <detail::record_builder::data_parsing_function Parser>
-  multi_series_builder(policy_type policy, settings s, Parser&& parser,
-                       std::vector<type> schemas = {})
+  multi_series_builder(policy_type policy, settings_type settings,
+                       Parser&& parser, std::vector<type> schemas = {})
     : policy_{std::move(policy)},
-      settings_{std::move(s)},
+      settings_{std::move(settings)},
       parser_{std::forward<Parser>(parser)},
       schemas_{std::move(schemas)} {
     if (auto p = get_policy<policy_merge>()) {
@@ -242,13 +243,10 @@ private:
   // gets the next free index into `entries_`.
   std::optional<size_t> next_free_index() const;
 
-  auto type_for_schema(std::string_view str)
-    -> std::optional<std::reference_wrapper<const type>>;
+  auto type_for_schema(std::string_view str) -> const type*;
 
   struct entry_data {
-    explicit entry_data(std::string name,
-                        std::optional<std::reference_wrapper<const type>> schema
-                        = std::nullopt)
+    entry_data(std::string name, const tenzir::type* schema = nullptr)
       : name{std::move(name)},
         builder{schema},
         flushed{std::chrono::steady_clock::now()} {
@@ -286,7 +284,7 @@ private:
   using signature_type = typename record_builder::signature_type;
 
   policy_type policy_;
-  settings settings_;
+  settings_type settings_;
   std::function<caf::expected<tenzir::data>(std::string, const tenzir::type*)>
     parser_;
   std::vector<type> schemas_;
@@ -301,7 +299,7 @@ private:
   std::vector<caf::error> errors_;
   std::chrono::steady_clock::time_point last_yield_time_
     = std::chrono::steady_clock::now();
-  size_t active_index_ = invalid_index;
+  size_t active_index_ = 0;
 };
 
 } // namespace tenzir
