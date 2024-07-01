@@ -1309,6 +1309,13 @@ series_builder::series_builder(
   }
 }
 
+series_builder::series_builder(const tenzir::type* ty)
+  : impl_{std::make_unique<detail::series_builder_impl>()} {
+  if (ty) {
+    impl_->protect(*ty);
+  }
+}
+
 series_builder::~series_builder() = default;
 
 series_builder::series_builder(series_builder&&) noexcept = default;
