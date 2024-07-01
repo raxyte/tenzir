@@ -286,7 +286,7 @@ TEST(signature record seeding matching) {
     {"0", uint64_type{}},
     {"1", int64_type{}},
   }};
-  CHECK(not b.append_signature_to(sig, noop_parser, seed));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed));
 
   detail::record_builder::signature_type expected;
   {
@@ -326,7 +326,7 @@ TEST(signature record seeding field not in data) {
     {"0", uint64_type{}},
     {"1", int64_type{}},
   }};
-  CHECK(not b.append_signature_to(sig, noop_parser, seed));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed));
 
   detail::record_builder::signature_type expected;
   {
@@ -366,7 +366,7 @@ TEST(signature record seeding field not in data --no-extend-schema ) {
     {"0", uint64_type{}},
     {"1", int64_type{}},
   }};
-  CHECK(not b.append_signature_to(sig, noop_parser, seed, true ));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed, true ));
 
   detail::record_builder::signature_type expected;
   {
@@ -406,7 +406,7 @@ TEST(signature record seeding data - field not in seed) {
   tenzir::type seed{record_type{
     {"0", uint64_type{}},
   }};
-  CHECK(not b.append_signature_to(sig, noop_parser, seed));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed));
 
   detail::record_builder::signature_type expected;
   {
@@ -446,7 +446,7 @@ TEST(signature record seeding data - field not in seed --no-extend-schema) {
   tenzir::type seed{record_type{
     {"0", uint64_type{}},
   }};
-  CHECK(not b.append_signature_to(sig, noop_parser, seed, true));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed, true));
 
   detail::record_builder::signature_type expected;
   {
@@ -479,7 +479,7 @@ TEST(signature record seeding numeric mismatch) {
   }};
   // a strictly numeric mismatch does not return an error and is just handled by
   // casting to the seed type
-  CHECK(not b.append_signature_to(sig, noop_parser, seed));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed));
   // REQUIRE( err );
   // CHECK( err.code() == static_cast<uint8_t>( ec::type_clash )  );
 
