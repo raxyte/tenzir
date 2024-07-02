@@ -343,9 +343,9 @@ using rest_handler_actor = typed_actor_fwd<
     ->caf::result<rest_response>>::unwrap;
 
 /// The interface of a COMPONENT PLUGIN actor.
-using component_plugin_actor = typed_actor_fwd<>
+using component_plugin_actor = typed_actor_fwd<
   // Conform to the protocol of the STATUS CLIENT actor.
-  ::extend_with<status_client_actor>::unwrap;
+  >::extend_with<status_client_actor>::unwrap;
 
 /// The interface of a SOURCE actor.
 using source_actor = typed_actor_fwd<
@@ -431,6 +431,30 @@ using pipeline_executor_actor = typed_actor_fwd<
   // Resume the pipeline execution. No-op if it was not paused.
   auto(atom::resume)->caf::result<void>>::unwrap;
 
+/// The interface of a PACKAGE LISTENER actor.
+using package_listener_actor = typed_actor_fwd<
+  // Add a new package.
+  // Subscribers are notified in the following order:
+  //  1. context_manager component
+  //  2. pipeline_manager component
+  //  3. other subscribers
+  auto(atom::package_add, package)->caf::result<void>,
+  // Remove all pipelines from a package.
+  auto(atom::package_remove, std::string)->caf::result<void>>::unwrap;
+
+using package_provider_actor = typed_actor_fwd<
+  // Register as subscriber and get the initial state.
+  // Subscribers get the data in a two-step process:
+  //  1. As a response to the subscription message they
+  //     get a list of packages that were recovered from the on-disk state
+  //     of the previous run of the node.
+  //     This allows the subscribers to get rid of any left-over files that
+  //     were created by packages that have subsequently been removed.
+  //  2. The packages that are still installed are added via the regular
+  //     `package_add` subscription call.
+  auto(atom::subscribe, package_listener_actor)
+    ->caf::result<std::vector<std::string>>>::unwrap;
+
 using terminator_actor = typed_actor_fwd<
   // Shut down the given actors.
   auto(atom::shutdown, std::vector<caf::actor>)->caf::result<atom::done>>::unwrap;
@@ -471,6 +495,7 @@ CAF_BEGIN_TYPE_ID_BLOCK(tenzir_actors, caf::id_block::tenzir_atoms::end)
   TENZIR_ADD_TYPE_ID((tenzir::node_actor))
   TENZIR_ADD_TYPE_ID((tenzir::partition_actor))
   TENZIR_ADD_TYPE_ID((tenzir::partition_creation_listener_actor))
+  TENZIR_ADD_TYPE_ID((tenzir::package_listener_actor))
   TENZIR_ADD_TYPE_ID((tenzir::receiver_actor<tenzir::atom::done>))
   TENZIR_ADD_TYPE_ID((tenzir::receiver_actor<tenzir::diagnostic>))
   TENZIR_ADD_TYPE_ID((tenzir::receiver_actor<tenzir::table_slice>))
