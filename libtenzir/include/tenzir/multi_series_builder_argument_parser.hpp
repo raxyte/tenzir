@@ -17,7 +17,8 @@
 
 namespace tenzir {
 
-/// simple utility to parse the command line arguments for a multi_series_builder's settings
+/// simple utility to parse the command line arguments for a
+/// multi_series_builder's settings
 struct multi_series_builder_settings_parser {
 public:
   multi_series_builder_settings_parser(
@@ -25,9 +26,9 @@ public:
     : settings_{std::move(settings)} {
   }
 
-  auto add_to_parser(argument_parser& p) -> void ;
+  auto add_to_parser(argument_parser& parser) -> void;
 
-  auto get_settings() -> multi_series_builder::settings_type& ;
+  auto get_settings() -> multi_series_builder::settings_type&;
 
 private:
   std::optional<located<std::string>> default_name_;
@@ -44,9 +45,11 @@ struct multi_series_builder_policy_parser {
   }
 
 public:
-  auto add_to_parser(argument_parser& p) -> void;
+  auto add_to_parser(argument_parser& parser) -> void;
 
-  auto validated_policy( const multi_series_builder::settings_type& settings, parser_interface& p ) -> multi_series_builder::policy_type&;
+  auto
+  validated_policy(const multi_series_builder::settings_type& settings,
+                   parser_interface& p) -> multi_series_builder::policy_type&;
   // If we leave these public, the json parser can keep supporting its old
   // options by checking/setting values here
   // TODO do we even want that?

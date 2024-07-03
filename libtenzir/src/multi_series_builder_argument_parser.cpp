@@ -58,12 +58,12 @@ auto multi_series_builder_settings_parser::get_settings()
   return settings_;
 }
 
-auto multi_series_builder_policy_parser::add_to_parser(argument_parser& p)
+auto multi_series_builder_policy_parser::add_to_parser(argument_parser& parser)
   -> void {
-  p.add("--policy", policy_str_, "<policy>");
-  p.add("--reset-per-batch", reset_on_yield_);
-  p.add("--schema", schema_, "<schema>");
-  p.add("--selector", selector_, "<selector>");
+  parser.add("--policy", policy_str_, "<policy>");
+  parser.add("--reset-per-batch", reset_on_yield_);
+  parser.add("--schema", schema_, "<schema>");
+  parser.add("--selector", selector_, "<selector>");
 }
 
 auto multi_series_builder_policy_parser::validated_policy(
