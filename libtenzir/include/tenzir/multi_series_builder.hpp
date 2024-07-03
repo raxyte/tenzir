@@ -75,6 +75,17 @@ public:
     };
     return std::visit(visitor, var_);
   }
+  void data_unparsed(std::string s) {
+    const auto visitor = detail::overload{
+      [&](tenzir::builder_ref& b) {
+        b.data(s);
+      },
+      [&](raw_pointer raw) {
+        raw->data_unparsed(std::move(s));
+      },
+    };
+    return std::visit(visitor, var_);
+  }
 
   /// sets the value of the field an empty record and returns a generator for
   /// the record
@@ -113,6 +124,18 @@ public:
     };
     return std::visit(visitor, var_);
   }
+
+  void data_unparsed(std::string s) {
+    const auto visitor = detail::overload{
+      [&](tenzir::builder_ref& b) {
+        b.data(s);
+      },
+      [&](raw_pointer raw) {
+        raw->data_unparsed(std::move(s));
+      },
+    };
+    return std::visit(visitor, var_);
+  }
   /// appends a record to the list and returns a generator for the record
   auto record() -> record_generator;
 
@@ -126,6 +149,12 @@ private:
   std::variant<tenzir::builder_ref, raw_pointer> var_;
 };
 } // namespace detail::multi_series_builder
+
+auto series_to_table_slice(series array, std::string_view fallback_name
+                                         = "tenzir.unknown") -> table_slice;
+auto series_to_table_slice(std::vector<series> data,
+                           std::string_view fallback_name
+                           = "tenzir.unknown") -> std::vector<table_slice>;
 
 class multi_series_builder {
 public:
@@ -158,6 +187,11 @@ public:
     bool reset_on_yield = false;
     // a schema name to seed with. If this is given
     std::optional<std::string> seed_schema = {};
+
+    auto friend inspect(auto& f, policy_merge& x) -> bool {
+      return f.object(x).fields(f.field("reset_on_yield", x.reset_on_yield),
+                                f.field("seed_schema", x.seed_schema));
+    }
   };
 
   // this policy will keep all schemas in separate batches
@@ -166,6 +200,10 @@ public:
     // If this is given, all resulting events will have exactly this schema
     // * all fields in the schema but not in the event will be null
     std::optional<std::string> seed_schema = {};
+
+    auto friend inspect(auto& f, policy_precise& x) -> bool {
+      return f.object(x).fields(f.field("seed_schema", x.seed_schema));
+    }
   };
 
   // this policy will keep all schemas in batches according to selector
@@ -178,10 +216,15 @@ public:
     // => {"event_type": "flow"}
     // => "suricata.flow"
     std::optional<std::string> naming_prefix = {};
+
+    auto friend inspect(auto& f, policy_selector& x) -> bool {
+      return f.object(x).fields(f.field("field_name", x.field_name),
+                                f.field("naming_prefix", x.naming_prefix));
+    }
   };
 
   using policy_type
-    = std::variant<policy_merge, policy_precise, policy_selector>;
+    = tenzir::variant<policy_merge, policy_precise, policy_selector>;
 
   struct settings_type {
     // the default name given to a schema
@@ -196,6 +239,13 @@ public:
     duration timeout = defaults::import::batch_timeout;
     // batch size after which the events should be yielded
     size_t desired_batch_size = defaults::import::table_slice_size;
+
+    auto friend inspect(auto& f, settings_type& x) -> bool {
+      return f.object(x).fields(
+        f.field("default_name", x.default_name), f.field("ordered", x.ordered),
+        f.field("schema_only", x.schema_only), f.field("timeout", x.timeout),
+        f.field("desired_batch_size", x.desired_batch_size));
+    }
   };
 
   template <detail::record_builder::data_parsing_function Parser>
@@ -212,10 +262,9 @@ public:
     }
   }
 
-  multi_series_builder(const multi_series_builder&) = delete;
-  multi_series_builder& operator=(const multi_series_builder&) = delete;
-  multi_series_builder(multi_series_builder&&) = delete;
-  multi_series_builder& operator=(multi_series_builder&&) = delete;
+  // BE AWARE THAT MOVING A MULTI_SERIES_BUILDER MAY
+  // INVALIDATE PREVIOUSLY OBTAINED HANDLES
+  multi_series_builder(multi_series_builder&&) = default;
 
   ~multi_series_builder() {
     const auto remaining_events = finalize();

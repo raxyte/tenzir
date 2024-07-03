@@ -88,7 +88,65 @@ auto field_generator::list() -> list_generator {
 void field_generator::null() {
   return this->data(caf::none);
 }
+
+void list_generator::null() {
+  return this->data(caf::none);
+}
+
+auto list_generator::record() -> record_generator {
+  const auto visitor = detail::overload{
+    [&](tenzir::builder_ref& b) {
+      return record_generator{b.record()};
+    },
+    [&](raw_pointer raw) {
+      return record_generator{raw->record()};
+    },
+  };
+  return std::visit(visitor, var_);
+}
+
+auto list_generator::list() -> list_generator {
+  const auto visitor = detail::overload{
+    [&](tenzir::builder_ref& b) {
+      return list_generator{b.list()};
+    },
+    [&](raw_pointer raw) {
+      return list_generator{raw->list()};
+    },
+  };
+  return std::visit(visitor, var_);
+}
+
+/// append a null value to the list
+
 } // namespace detail::multi_series_builder
+
+auto series_to_table_slice(series array,
+                           std::string_view fallback_name) -> table_slice {
+  TENZIR_ASSERT(caf::holds_alternative<record_type>(array.type));
+  TENZIR_ASSERT(array.length() > 0);
+  if (array.type.name().empty()) {
+    array.type = tenzir::type{fallback_name, array.type};
+  }
+  auto* cast = dynamic_cast<arrow::StructArray*>(array.array.get());
+  TENZIR_ASSERT(cast);
+  auto arrow_schema = array.type.to_arrow_schema();
+  auto batch = arrow::RecordBatch::Make(std::move(arrow_schema), cast->length(),
+                                        cast->fields());
+  TENZIR_ASSERT(batch);
+  TENZIR_ASSERT_EXPENSIVE(batch->Validate().ok());
+  return table_slice{std::move(batch), std::move(array.type)};
+}
+auto series_to_table_slice(std::vector<series> data,
+                           std::string_view fallback_name)
+  -> std::vector<table_slice> {
+  auto result = std::vector<table_slice>{};
+  result.resize(data.size());
+  std::ranges::transform(data, result.begin(), [fallback_name](auto s) {
+    return series_to_table_slice(s, fallback_name);
+  });
+  return result;
+}
 
 auto multi_series_builder::yield_ready() -> std::vector<series> {
   const auto now = std::chrono::steady_clock::now();
@@ -189,7 +247,7 @@ void multi_series_builder::complete_last_event() {
                                             schema_type, settings_.schema_only);
   if (e) {
     errors_.push_back(std::move(e));
-    //TODO re-consider what to do with an errored event 
+    // TODO re-consider what to do with an errored event
   }
   auto free_index = next_free_index();
   auto [it, inserted] = signature_map_.try_emplace(
