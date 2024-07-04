@@ -34,7 +34,7 @@ namespace detail::record_builder {
 // builders internal structure into the parser
 template <typename P>
 concept data_parsing_function
-  = requires(P parser, std::string str, const tenzir::type* seed) {
+  = requires(P parser, std::string_view str, const tenzir::type* seed) {
       { parser(str, seed) } -> std::same_as<caf::expected<tenzir::data>>;
     };
 
@@ -253,7 +253,7 @@ public:
   auto data(tenzir::data) -> void;
   /// adds an unparsed data value to this field. It is later parsed during the
   /// signature computation step
-  auto data_unparsed(std::string) -> void;
+  auto data_unparsed(std::string_view) -> void;
   /// adds a null value to the list
   auto null() -> void;
   /// adds a new record to the list
@@ -321,7 +321,7 @@ public:
   auto data(tenzir::data) -> void;
   /// adds an unparsed data value to this field. It is later parsed during the
   /// signature computation step
-  auto data_unparsed(std::string raw_text) -> void;
+  auto data_unparsed(std::string_view raw_text) -> void;
   auto null() -> void;
   [[nodiscard]] auto record() -> node_record*;
   [[nodiscard]] auto list() -> node_list*;
@@ -451,7 +451,7 @@ public:
   /// a very basic parser that simply uses `tenzir::parsers` under the hood
   /// this parser does not support the seed pointing to a structural type
   static auto
-  basic_parser(std::string s,
+  basic_parser(std::string_view s,
                const tenzir::type* seed) -> caf::expected<tenzir::data>;
 
   /// parses any unparsed fields using `parser`, potentially providing a

@@ -31,6 +31,9 @@ namespace tenzir {
 
 class multi_series_builder;
 
+using parser_function_type = std::function<caf::expected<tenzir::data>(
+  std::string_view, const tenzir::type*)>;
+
 namespace detail::multi_series_builder {
 
 using signature_type = std::vector<std::byte>;
@@ -42,7 +45,9 @@ class record_generator {
   using raw_pointer = detail::record_builder::node_record*;
 
 public:
-  explicit record_generator(tenzir::record_ref builder) : var_{builder} {
+  explicit record_generator(tenzir::record_ref builder,
+                            parser_function_type* parser)
+    : var_{std::in_place_type<series_builder_element>, builder, parser} {
   }
   explicit record_generator(raw_pointer raw) : var_{raw} {
   }
@@ -50,14 +55,19 @@ public:
   auto field(std::string_view name) -> field_generator;
 
 private:
-  std::variant<tenzir::record_ref, raw_pointer> var_;
+  struct series_builder_element {
+    tenzir::record_ref ref;
+    parser_function_type* parser;
+  };
+  std::variant<series_builder_element, raw_pointer> var_;
 };
 
 class field_generator {
   using raw_pointer = detail::record_builder::node_field*;
 
 public:
-  field_generator(builder_ref origin) : var_{origin} {
+  field_generator(builder_ref builder, parser_function_type* parser)
+    : var_{std::in_place_type<series_builder_element>, builder, parser} {
   }
   field_generator(raw_pointer raw) : var_{raw} {
   }
@@ -66,8 +76,8 @@ public:
   template <tenzir::detail::record_builder::non_structured_data_type T>
   void data(T d) {
     const auto visitor = detail::overload{
-      [&](tenzir::builder_ref& b) {
-        b.data(d);
+      [&](series_builder_element& b) {
+        b.ref.data(d);
       },
       [&](raw_pointer raw) {
         raw->data(d);
@@ -75,10 +85,13 @@ public:
     };
     return std::visit(visitor, var_);
   }
-  void data_unparsed(std::string s) {
+
+  void data_unparsed(std::string_view s) {
     const auto visitor = detail::overload{
-      [&](tenzir::builder_ref& b) {
-        b.data(s);
+      [&](series_builder_element& b) {
+        auto res = (*b.parser)(s, nullptr);
+        TENZIR_ASSERT(res);
+        b.ref.data(*res);
       },
       [&](raw_pointer raw) {
         raw->data_unparsed(std::move(s));
@@ -99,14 +112,19 @@ public:
   void null();
 
 private:
-  std::variant<tenzir::builder_ref, raw_pointer> var_;
+  struct series_builder_element {
+    tenzir::builder_ref ref;
+    parser_function_type* parser;
+  };
+  std::variant<series_builder_element, raw_pointer> var_;
 };
 
 class list_generator {
   using raw_pointer = detail::record_builder::node_list*;
 
 public:
-  list_generator(builder_ref origin) : var_{origin} {
+  list_generator(builder_ref builder, parser_function_type* parser)
+    : var_{std::in_place_type<series_builder_element>, builder, parser} {
   }
   list_generator(raw_pointer raw) : var_{raw} {
   }
@@ -115,8 +133,8 @@ public:
   template <tenzir::detail::record_builder::non_structured_data_type T>
   void data(T d) {
     const auto visitor = detail::overload{
-      [&](tenzir::builder_ref& b) {
-        b.data(d);
+      [&](series_builder_element& b) {
+        b.ref.data(d);
       },
       [&](raw_pointer raw) {
         raw->data(d);
@@ -125,13 +143,15 @@ public:
     return std::visit(visitor, var_);
   }
 
-  void data_unparsed(std::string s) {
+  void data_unparsed(std::string_view s) {
     const auto visitor = detail::overload{
-      [&](tenzir::builder_ref& b) {
-        b.data(s);
+      [&](series_builder_element& b) {
+        auto res = (*b.parser)(s, nullptr);
+        TENZIR_ASSERT(res);
+        b.ref.data(*res);
       },
       [&](raw_pointer raw) {
-        raw->data_unparsed(std::move(s));
+        raw->data_unparsed(s);
       },
     };
     return std::visit(visitor, var_);
@@ -146,7 +166,11 @@ public:
   void null();
 
 private:
-  std::variant<tenzir::builder_ref, raw_pointer> var_;
+  struct series_builder_element {
+    tenzir::builder_ref ref;
+    parser_function_type* parser;
+  };
+  std::variant<series_builder_element, raw_pointer> var_;
 };
 } // namespace detail::multi_series_builder
 
@@ -334,8 +358,7 @@ private:
 
   policy_type policy_;
   settings_type settings_;
-  std::function<caf::expected<tenzir::data>(std::string, const tenzir::type*)>
-    parser_;
+  parser_function_type parser_;
   std::vector<type> schemas_;
 
   record_builder builder_raw_;

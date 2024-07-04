@@ -111,7 +111,7 @@ struct type_to_parser<subnet_type>
 template <typename T>
 concept has_parser = caf::detail::is_complete<type_to_parser<T>>();
 
-auto record_builder::basic_parser(std::string s, const tenzir::type* seed)
+auto record_builder::basic_parser(std::string_view s, const tenzir::type* seed)
   -> caf::expected<tenzir::data> {
   if (not seed) {
     tenzir::data result;
@@ -321,10 +321,10 @@ auto node_field::data(tenzir::data d) -> void {
   return caf::visit(visitor, d);
 }
 
-auto node_field::data_unparsed(std::string text) -> void {
+auto node_field::data_unparsed(std::string_view text) -> void {
   mark_this_alive();
   is_raw_ = true;
-  data_.emplace<std::string>(std::move(text));
+  data_.emplace<std::string>(text);
 }
 
 auto node_field::record() -> node_record* {
@@ -485,7 +485,7 @@ auto node_list::data(tenzir::data d) -> void {
   return caf::visit(visitor, d);
 }
 
-auto node_list::data_unparsed(std::string text) -> void {
+auto node_list::data_unparsed(std::string_view text) -> void {
   mark_this_alive();
   type_index_ = type_index_generic_mismatch;
   if (auto* free = find_free()) {

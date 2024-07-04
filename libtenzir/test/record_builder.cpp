@@ -23,7 +23,7 @@ namespace {
 using namespace detail::record_builder;
 using namespace std::literals;
 
-auto noop_parser(std::string, const tenzir::type*) -> caf::expected<data> {
+auto noop_parser(std::string_view, const tenzir::type*) -> caf::expected<data> {
   return data{};
 }
 
@@ -355,7 +355,7 @@ TEST(signature record seeding field not in data) {
   CHECK(sig == expected);
 }
 
-TEST(signature record seeding field not in data --no-extend-schema ) {
+TEST(signature record seeding field not in data-- no - extend - schema) {
   record_builder b;
   auto* r = b.record();
   r->field("0")->data(0ul);
@@ -366,7 +366,7 @@ TEST(signature record seeding field not in data --no-extend-schema ) {
     {"0", uint64_type{}},
     {"1", int64_type{}},
   }};
-  CHECK(not b.append_signature_to(sig, noop_parser, &seed, true ));
+  CHECK(not b.append_signature_to(sig, noop_parser, &seed, true));
 
   detail::record_builder::signature_type expected;
   {
@@ -435,7 +435,7 @@ TEST(signature record seeding data - field not in seed) {
   CHECK(sig == expected);
 }
 
-TEST(signature record seeding data - field not in seed --no-extend-schema) {
+TEST(signature record seeding data - field not in seed-- no - extend - schema) {
   record_builder b;
   auto* r = b.record();
   r->field("1")->data(0l);

@@ -51,8 +51,8 @@ namespace detail::multi_series_builder {
 
 auto record_generator::field(std::string_view name) -> field_generator {
   const auto visitor = detail::overload{
-    [&](tenzir::record_ref& rec) {
-      return field_generator{rec.field(name)};
+    [&](series_builder_element& b) {
+      return field_generator{b.ref.field(name), b.parser};
     },
     [&](raw_pointer raw) {
       return field_generator{raw->field(name)};
@@ -63,8 +63,8 @@ auto record_generator::field(std::string_view name) -> field_generator {
 
 auto field_generator::record() -> record_generator {
   const auto visitor = detail::overload{
-    [&](tenzir::builder_ref& b) {
-      return record_generator{b.record()};
+    [&](series_builder_element& b) {
+      return record_generator{b.ref.record(), b.parser};
     },
     [&](raw_pointer raw) {
       return record_generator{raw->record()};
@@ -75,8 +75,8 @@ auto field_generator::record() -> record_generator {
 
 auto field_generator::list() -> list_generator {
   const auto visitor = detail::overload{
-    [&](tenzir::builder_ref& b) {
-      return list_generator{b.list()};
+    [&](series_builder_element& b) {
+      return list_generator{b.ref.list(), b.parser};
     },
     [&](raw_pointer raw) {
       return list_generator{raw->list()};
@@ -95,8 +95,8 @@ void list_generator::null() {
 
 auto list_generator::record() -> record_generator {
   const auto visitor = detail::overload{
-    [&](tenzir::builder_ref& b) {
-      return record_generator{b.record()};
+    [&](series_builder_element& b) {
+      return record_generator{b.ref.record(), b.parser};
     },
     [&](raw_pointer raw) {
       return record_generator{raw->record()};
@@ -107,8 +107,8 @@ auto list_generator::record() -> record_generator {
 
 auto list_generator::list() -> list_generator {
   const auto visitor = detail::overload{
-    [&](tenzir::builder_ref& b) {
-      return list_generator{b.list()};
+    [&](series_builder_element& b) {
+      return list_generator{b.ref.list(), b.parser};
     },
     [&](raw_pointer raw) {
       return list_generator{raw->list()};
@@ -116,9 +116,6 @@ auto list_generator::list() -> list_generator {
   };
   return std::visit(visitor, var_);
 }
-
-/// append a null value to the list
-
 } // namespace detail::multi_series_builder
 
 auto series_to_table_slice(series array,
@@ -177,7 +174,7 @@ auto multi_series_builder::last_errors() -> std::vector<caf::error> {
 
 auto multi_series_builder::record() -> record_generator {
   if (get_policy<policy_merge>()) {
-    return record_generator{merging_builder_.record()};
+    return record_generator{merging_builder_.record(), &parser_};
   } else {
     complete_last_event();
     return record_generator{builder_raw_.record()};
