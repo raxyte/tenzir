@@ -172,6 +172,51 @@ private:
   };
   std::variant<series_builder_element, raw_pointer> var_;
 };
+
+template <record_builder::non_structured_data_type T>
+auto insert_data_unflattend_unsafe(record_generator r, std::string_view key,
+                                   std::string_view unflatten, T&& value) {
+  auto pos = key.find(unflatten);
+  if (pos == key.npos) {
+    return r.field(key).data(std::forward<T>(value));
+  }
+  return insert_data_unflattend_unsafe(r.field(key.substr(0, pos)).record(),
+                                       key.substr(pos + unflatten.size()),
+                                       unflatten, std::forward<T>(value));
+}
+
+template <record_builder::non_structured_data_type T>
+auto insert_data_unflattend(record_generator r, std::string_view key,
+                            std::string_view unflatten, T&& value) {
+  if (unflatten.empty()) {
+    return r.field(key).data(std::forward<T>(value));
+  }
+  return insert_data_unflattend_unsafe(r, key, unflatten,
+                                       std::forward<T>(value));
+}
+
+inline auto
+insert_unparsed_unflattend_unsafe(record_generator r, std::string_view key,
+                                  std::string_view unflatten,
+                                  std::string_view value) {
+  auto pos = key.find(unflatten);
+  if (pos == key.npos) {
+    return r.field(key).data_unparsed(value);
+  }
+  return insert_unparsed_unflattend_unsafe(r.field(key.substr(0, pos)).record(),
+                                           key.substr(pos + unflatten.size()),
+                                           unflatten, value);
+}
+
+inline auto
+insert_unparsed_unflattend(record_generator r, std::string_view key,
+                           std::string_view unflatten, std::string_view value) {
+  if (unflatten.empty()) {
+    return r.field(key).data_unparsed(value);
+  }
+  return insert_unparsed_unflattend_unsafe(r, key, unflatten, value);
+}
+
 } // namespace detail::multi_series_builder
 
 auto series_to_table_slice(series array, std::string_view fallback_name
@@ -192,7 +237,7 @@ public:
   auto yield_ready() -> std::vector<series>;
 
   [[nodiscard("The result of a flush must be handled")]]
-  auto last_errors() -> std::vector<caf::error>; // FIXME implement this
+  auto last_errors() -> std::vector<caf::error>;
 
   /// adds a record to the currently active builder
   [[nodiscard]] auto record() -> record_generator;
@@ -290,19 +335,14 @@ public:
   // INVALIDATE PREVIOUSLY OBTAINED HANDLES
   multi_series_builder(multi_series_builder&&) = default;
 
-  ~multi_series_builder() {
-    const auto remaining_events = finalize();
-    TENZIR_ASSERT(remaining_events.size() == 0,
-                  "Please 'co_yield 'msb.finish_all_events()'"
-                  " at before the end of msb's lifetime.");
-  }
-
 private:
   /// gets a pointer to the active policy, if its the given one.
   /// the implementation is in the source file, since its a private/internal
   /// function and thus will only be instantiated by other member functions
   template <typename T>
-  T* get_policy();
+  T* get_policy() {
+    return std::get_if<T>(&policy_);
+  }
 
   // called internally once an event is complete.
   // this function is responsible for committing
@@ -344,8 +384,8 @@ private:
   void make_events_available_where(std::predicate<const entry_data&> auto pred);
 
   /// appends `new_events` to `ready_events_`
-  /// TODO Improvement: The series builder could take in a vector instead of
-  /// returning one from flush()
+  /// TODO Improvement: The `series_builder` could take in a vector instead of
+  /// returning one from flush(). That way would could write into an existing allocation
   void append_ready_events(std::vector<series>&& new_events);
 
   /// GCs `series_builders` from `entries_` that satisfy the predicate

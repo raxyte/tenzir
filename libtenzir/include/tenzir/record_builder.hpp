@@ -19,13 +19,14 @@
 #include <caf/expected.hpp>
 
 #include <cstddef>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace tenzir {
-
+class multi_series_builder;
 class record_builder;
 namespace detail::record_builder {
 
@@ -78,10 +79,30 @@ concept non_structured_data_type
       T>::value;
 
 template <typename T>
-concept numeric_type
+concept non_structured_type_type
+  = caf::detail::tl_contains<concrete_types, T>::value
+    and not caf::detail::tl_contains<
+      caf::detail::type_list<record_type, list_type, legacy_pattern_type,
+                             map_type>,
+      T>::value;
+
+template <typename T>
+concept numeric_data_type
   = non_structured_data_type<T>
     and (std::same_as<T, uint64_type> or std::same_as<T, int64_type>
          or std::same_as<T, double_type>);
+
+// clang-format off
+template <typename T>
+concept unsupported_types
+  =  caf::detail::tl_contains<
+      caf::detail::type_list<
+        tenzir::map_type, tenzir::map, map_dummy,
+        tenzir::legacy_pattern_type, tenzir::pattern, pattern_dummy,
+        enriched_dummy
+      >,
+      T>::value;
+// clang-format on
 
 using signature_type = std::vector<std::byte>;
 
@@ -310,6 +331,7 @@ class node_field : public node_base {
   friend class node_list;
   friend struct node_record::entry_type;
   friend class ::tenzir::record_builder;
+  friend class ::tenzir::multi_series_builder;
 
 public:
   /// sets this field to a parsed, typed data value
@@ -331,6 +353,7 @@ public:
   template <non_structured_data_type T>
   node_field(T data) : data_{std::in_place_type<T>, data} {
   }
+
 
 private:
   auto current_index() const -> size_t {
@@ -522,10 +545,15 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
                                       bool schema_only) -> caf::error {
   sig.push_back(record_start_marker);
   // if we have a seed, we need too ensure that all fields exist first
+  // FIXME it could be even better to build this lookup for all fields once per
+  // schema in the MSB. Is that worth it though?
+  constinit thread_local static std::vector<record_type::field_view> seed_fields;
   if (seed) {
-    for (const auto& [k, v] : seed->fields()) {
-      auto* ptr = try_field(k);
+    seed_fields.clear();
+    for ( auto v : seed->fields()) {
+      auto* ptr = try_field(v.name);
       ptr->mark_this_relevant();
+      seed_fields.push_back(std::move(v));
     }
   }
   auto err = caf::error{};
@@ -536,21 +564,18 @@ auto node_record::append_to_signature(signature_type& sig, Parser& p,
     if (field.affects_signature()) {
       if (seed) {
         bool handled_by_seed = false;
-        // TODO is this a good idea????? I dont see any other way to
-        // find the type for a field with a given name
-        // a non-generator based API to get these would be ideal, so
-        // we dont have to iterate for every key
-        for (const auto& [seed_key, seed_type] : seed->fields()) {
-          if (seed_key == k) {
-            handled_by_seed = true;
-            const auto key_bytes = as_bytes(k);
-            sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
-            auto e = field.append_to_signature(sig, p, &seed_type, schema_only);
-            if (e and not err) {
-              err = std::move(e);
-            }
-            break;
+        const auto it
+          = std::ranges::find(seed_fields, k, &record_type::field_view::name);
+
+        if (it != seed_fields.end()) {
+          handled_by_seed = true;
+          const auto key_bytes = as_bytes(k);
+          sig.insert(sig.end(), key_bytes.begin(), key_bytes.end());
+          auto e = field.append_to_signature(sig, p, &it->type, schema_only);
+          if (e and not err) {
+            err = std::move(e);
           }
+          break;
         }
         if (handled_by_seed) {
           continue;
@@ -843,6 +868,11 @@ auto node_list::append_to_signature(signature_type& sig, Parser& p,
       seed_type_ptr = &seed_type;
     }
     auto last_sig_index = 0;
+    if (seed and data_.empty()) {
+      node_field sentinel;
+      sentinel.state_ = state::sentinel;
+      return sentinel.append_to_signature(sig, p, seed_type_ptr, schema_only);
+    }
     for (auto& v : data_) {
       auto next_sig_index = sig.size();
       auto element_error

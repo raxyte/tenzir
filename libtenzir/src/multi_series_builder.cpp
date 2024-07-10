@@ -27,20 +27,6 @@
 namespace tenzir {
 namespace {
 using signature_type = detail::multi_series_builder::signature_type;
-data materialize(const data_view2& v) {
-  constexpr static auto view_to_data = []<typename T>(const T& alt) {
-    return tenzir::data{materialize(alt)};
-  };
-  return std::visit(view_to_data, v);
-}
-
-data materialize(data_view2&& v) {
-  constexpr static auto view_to_data = []<typename T>(T&& alt) {
-    return tenzir::data{materialize(std::move(alt))};
-  };
-  return std::visit(view_to_data, std::move(v));
-}
-
 void append_name_to_signature(std::string_view x, signature_type& out) {
   auto name_bytes = as_bytes(x);
   out.insert(out.end(), name_bytes.begin(), name_bytes.end());
@@ -159,11 +145,11 @@ auto multi_series_builder::yield_ready() -> std::vector<series> {
      target_size = settings_.desired_batch_size](const entry_data& e) {
       return e.builder.length()
                >= static_cast<int64_t>(target_size) // batch size hit
-             or now - e.flushed < timeout;          // timeout hit
+             or now - e.flushed >= timeout;         // timeout hit
     });
   garbage_collect_where(
     [now, timeout = settings_.timeout](const entry_data& e) {
-      return now - e.flushed > 10 * timeout;
+      return now - e.flushed >= 10 * timeout;
     });
   return std::exchange(ready_events_, {});
 }
@@ -205,11 +191,6 @@ auto multi_series_builder::finalize() -> std::vector<series> {
   return std::exchange(ready_events_, {});
 }
 
-template <typename T>
-T* multi_series_builder::get_policy() {
-  return std::get_if<T>(&policy_);
-}
-
 void multi_series_builder::complete_last_event() {
   if (get_policy<policy_merge>()) {
     return; // merging mode just writes directly into a series builder
@@ -217,17 +198,35 @@ void multi_series_builder::complete_last_event() {
   if (not builder_raw_.has_elements()) {
     return; // an empty raw field does not need to be written back
   }
-  auto r = builder_raw_.materialize(false);
   std::string schema_name;
   if (auto p = get_policy<policy_selector>()) {
-    auto* selected_schema
-      = builder_raw_.find_value_typed<std::string>(p->field_name);
+    // FIXME typed lookup is incorrect
+    auto* selected_schema = builder_raw_.find_field_raw(p->field_name);
     if (selected_schema) {
-      if (p->naming_prefix) {
-        schema_name = fmt::format("{}.{}", p->naming_prefix, *selected_schema);
-      } else {
-        schema_name = *selected_schema;
-      }
+      const auto visitor = detail::overload{
+        [p]<detail::record_builder::non_structured_data_type T>(
+          const T& v) -> std::string {
+          if (p->naming_prefix) {
+            return fmt::format("{}.{}", *(p->naming_prefix), v);
+          } else {
+            return fmt::format("{}", v);
+          }
+        },
+        [](const caf::none_t& ) -> std::string {
+          return "null"; //TODO this is a magic constant.
+        },
+        [](const blob&) -> std::string {
+          TENZIR_ASSERT(false, "A `blob` cannot be used as the selector field" );
+          TENZIR_UNREACHABLE();
+          return {};
+        },
+        [](const auto&) -> std::string {
+          return {};
+        },
+      };
+      schema_name = std::visit(visitor, selected_schema->data_);
+    } else {
+      // TODO should this raise some warning?
     }
   } else if (auto p = get_policy<policy_precise>()) {
     if (p->seed_schema) {

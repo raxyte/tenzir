@@ -164,13 +164,16 @@ public:
         return false;
       }
       auto key = maybe_key.value_unsafe();
-      // FIXME unflatten
       auto val = pair.value();
       if (val.error()) {
         report_parse_err(val, fmt::format("object value at key `{}`", key));
         return false;
       }
-      if (not parse_impl(val.value_unsafe(), builder.field(key), depth + 1)) {
+      const bool value_parse_success
+        = unnest_
+            ? parse_impl_unnest(val.value_unsafe(), key, builder, depth + 1)
+            : parse_impl(val.value_unsafe(), builder.field(key), depth + 1);
+      if (not value_parse_success) {
         return false;
       }
     }
@@ -308,6 +311,18 @@ private:
       }
     }
     return true;
+  }
+
+  [[nodiscard]] auto
+  parse_impl_unnest(simdjson::ondemand::value val, std::string_view key,
+                    auto builder, size_t root_depth) -> bool {
+    auto pos = key.find(*unnest_);
+    if (pos == key.npos) {
+      return parse_impl(val, builder.field(key), root_depth);
+    }
+    return parse_impl_unnest(val, key.substr(pos + 1),
+                             builder.field(key.substr(0, pos)).record(),
+                             root_depth);
   }
 
   [[nodiscard]] auto parse_impl(simdjson::ondemand::value val, auto builder,
@@ -547,12 +562,14 @@ template <class GeneratorValue>
 auto parser_loop(generator<GeneratorValue> json_chunk_generator,
                  std::derived_from<parser_base> auto parser_impl)
   -> generator<table_slice> {
-  // After this point, we always have an active entry.
   for (auto chunk : json_chunk_generator) {
-    // Flush builders if their timeout has expired.
+    // get all events that are ready (timeout, batch size, ordered mode constraints)
     for (auto slice :
          series_to_table_slice(parser_impl.builder.yield_ready())) {
       co_yield std::move(slice);
+    }
+    for ( auto err : parser_impl.builder.last_errors() ) {
+      diagnostic::warning(err).emit(parser_impl.ctrl.diagnostics());
     }
     if (not chunk or chunk->size() == 0u) {
       co_yield {};
@@ -567,7 +584,7 @@ auto parser_loop(generator<GeneratorValue> json_chunk_generator,
   if (parser_impl.abort_requested) {
     co_return;
   }
-  // Flush all entries.
+  // Get all remaining events
   for (auto slice : series_to_table_slice(parser_impl.builder.finalize())) {
     co_yield std::move(slice);
   }
@@ -839,6 +856,7 @@ public:
     parser.parse(p);
     auto settings = ps.get_settings();
     auto policy = pp.validated_policy(settings, p);
+      //FIXME set defaultname for selector
     auto args = parser_args{std::move(settings), std::move(policy)};
     pj.write_into(args, p);
     pc.write_into(args);
@@ -875,6 +893,7 @@ public:
       name(), fmt::format("https://docs.tenzir.com/formats/{}", name())};
     common_parser_options_parser pc;
     pc.add_to_parser(parser);
+
     parser.parse(p);
     auto args = parser_args{};
     args.use_gelf_mode = true;
@@ -897,6 +916,7 @@ public:
     auto parser = argument_parser{
       name(), fmt::format("https://docs.tenzir.com/formats/{}", name())};
     auto args = parser_args{};
+    //FIXME set default name correctly
     multi_series_builder_settings_parser ps;
     ps.add_to_parser(parser);
     parser.parse(p);
