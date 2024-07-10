@@ -267,6 +267,11 @@ tenzir:
       # - Set the option to a valid duration to enable with a custom delay.
       restart-on-error: 1 minute
 
+
+  # The path from which the node attempts to read statically configured packages.
+  # This setting is ignored unless the pipeline manager plugin is enabled.
+  # packages-dir: <sysconfir>/packages
+
 # The below settings are internal to CAF, and aren't checked by Tenzir directly.
 # Please be careful when changing these options. Note that some CAF options may
 # be in conflict with Tenzir options, and are only listed here for completeness.
