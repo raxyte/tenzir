@@ -207,7 +207,7 @@ auto pipeline_executor_state::start() -> caf::result<void> {
     for (const auto& op : pipe.operators()) {
       if (op->location() == operator_location::remote) {
         TENZIR_DEBUG("{} connects to node because of remote operators", *self);
-        connect_to_node(self, content(self->system().config()),
+        connect_to_node(self,
                         [this, pipe = std::move(pipe)](
                           caf::expected<node_actor> result) mutable {
                           if (not result) {
@@ -264,7 +264,7 @@ auto pipeline_executor_state::resume() -> caf::result<void> {
 auto pipeline_executor(
   pipeline_executor_actor::stateful_pointer<pipeline_executor_state> self,
   pipeline pipe, receiver_actor<diagnostic> diagnostics,
-  receiver_actor<metric> metrics, node_actor node, bool has_terminal)
+  metrics_receiver_actor metrics, node_actor node, bool has_terminal)
   -> pipeline_executor_actor::behavior_type {
   TENZIR_DEBUG("{} was created", *self);
   self->state.self = self;

@@ -129,10 +129,6 @@ public:
     return {};
   }
 
-  // Deinitializes a plugin.
-  virtual auto deinitialize() -> void {
-  }
-
   /// Returns the unique name of the plugin.
   [[nodiscard]] virtual std::string name() const = 0;
 };
@@ -146,6 +142,11 @@ public:
   /// The name for this component in the registry.
   /// Defaults to the plugin name.
   virtual std::string component_name() const;
+
+  /// Components that should be created before the current one so initialization
+  /// can succeed.
+  /// Defaults to empty list.
+  virtual auto wanted_components() const -> std::vector<std::string>;
 
   /// Creates an actor as a component in the NODE.
   /// @param node A stateful pointer to the NODE actor.
@@ -247,7 +248,11 @@ public:
   auto serialize(serializer f, const Base& op) const -> bool override {
     TENZIR_ASSERT(op.name() == name());
     auto x = dynamic_cast<const Concrete*>(&op);
-    TENZIR_ASSERT(x);
+    TENZIR_ASSERT(x, fmt::format("expected {}, got {} ({}) ({} == {})",
+                                 typeid(Concrete).name(), typeid(op).name(),
+                                 typeid(Concrete) == typeid(op),
+                                 typeid(Concrete).hash_code(),
+                                 typeid(op).hash_code()));
     return std::visit(
       [&](auto& f) {
         return f.get().apply(*x);
@@ -1047,21 +1052,26 @@ extern const char* TENZIR_PLUGIN_VERSION;
       ::tenzir::plugin_ptr::make_builtin(__VA_ARGS__, {})
 #  endif
 
-#  define TENZIR_REGISTER_PLUGIN(name)                                         \
-    template <class>                                                           \
+#  define TENZIR_REGISTER_PLUGIN(...)                                          \
+    template <auto>                                                            \
     struct auto_register_plugin;                                               \
     template <>                                                                \
-    struct auto_register_plugin<name> {                                        \
+    struct auto_register_plugin<[] {}> {                                       \
       auto_register_plugin() {                                                 \
         static_cast<void>(flag);                                               \
       }                                                                        \
       static auto init() -> bool {                                             \
-        ::tenzir::plugins::get_mutable().push_back(TENZIR_MAKE_PLUGIN(         \
-          new (name), /* NOLINT(cppcoreguidelines-owning-memory) */            \
+        /* NOLINTBEGIN(cppcoreguidelines-owning-memory) */                     \
+        auto plugin = TENZIR_MAKE_PLUGIN(                                      \
+          new __VA_ARGS__,                                                     \
           +[](::tenzir::plugin* plugin) noexcept {                             \
-            delete plugin; /* NOLINT(cppcoreguidelines-owning-memory) */       \
+            delete plugin;                                                     \
           },                                                                   \
-          TENZIR_PLUGIN_VERSION));                                             \
+          TENZIR_PLUGIN_VERSION);                                              \
+        /* NOLINTEND(cppcoreguidelines-owning-memory) */                       \
+        const auto it = std::ranges::upper_bound(                              \
+          ::tenzir::plugins::get_mutable(), plugin);                           \
+        ::tenzir::plugins::get_mutable().insert(it, std::move(plugin));        \
         return true;                                                           \
       }                                                                        \
       inline static auto flag = init();                                        \
@@ -1077,7 +1087,7 @@ extern const char* TENZIR_PLUGIN_VERSION;
           ::tenzir::plugin_type_id_block{::caf::id_block::name::begin,         \
                                          ::caf::id_block::name::end},          \
           +[]() noexcept {                                                     \
-            caf::init_global_meta_objects<::caf::id_block::name>();            \
+            ::caf::init_global_meta_objects<::caf::id_block::name>();          \
           });                                                                  \
         return true;                                                           \
       }                                                                        \
@@ -1090,10 +1100,10 @@ extern const char* TENZIR_PLUGIN_VERSION;
 
 #else
 
-#  define TENZIR_REGISTER_PLUGIN(name)                                         \
+#  define TENZIR_REGISTER_PLUGIN(...)                                          \
     extern "C" auto tenzir_plugin_create() -> ::tenzir::plugin* {              \
       /* NOLINTNEXTLINE(cppcoreguidelines-owning-memory) */                    \
-      return new (name);                                                       \
+      return new __VA_ARGS__;                                                  \
     }                                                                          \
     extern "C" auto tenzir_plugin_destroy(class ::tenzir::plugin* plugin)      \
       -> void {                                                                \
@@ -1118,7 +1128,7 @@ extern const char* TENZIR_PLUGIN_VERSION;
 
 #  define TENZIR_REGISTER_PLUGIN_TYPE_ID_BLOCK_1(name)                         \
     extern "C" auto tenzir_plugin_register_type_id_block() -> void {           \
-      caf::init_global_meta_objects<::caf::id_block::name>();                  \
+      ::caf::init_global_meta_objects<::caf::id_block::name>();                \
     }                                                                          \
     extern "C" auto tenzir_plugin_type_id_block()                              \
       -> ::tenzir::plugin_type_id_block {                                      \
@@ -1127,8 +1137,8 @@ extern const char* TENZIR_PLUGIN_VERSION;
 
 #  define TENZIR_REGISTER_PLUGIN_TYPE_ID_BLOCK_2(name1, name2)                 \
     extern "C" auto tenzir_plugin_register_type_id_block() -> void {           \
-      caf::init_global_meta_objects<::caf::id_block::name1>();                 \
-      caf::init_global_meta_objects<::caf::id_block::name2>();                 \
+      ::caf::init_global_meta_objects<::caf::id_block::name1>();               \
+      ::caf::init_global_meta_objects<::caf::id_block::name2>();               \
     }                                                                          \
     extern "C" auto tenzir_plugin_type_id_block()                              \
       -> ::tenzir::plugin_type_id_block {                                      \

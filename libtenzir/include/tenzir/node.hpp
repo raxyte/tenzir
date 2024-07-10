@@ -11,7 +11,6 @@
 #include "tenzir/actors.hpp"
 #include "tenzir/command.hpp"
 #include "tenzir/component_registry.hpp"
-#include "tenzir/spawn_arguments.hpp"
 
 #include <caf/actor.hpp>
 #include <caf/stateful_actor.hpp>
@@ -27,26 +26,6 @@ namespace tenzir {
 
 /// State of the node actor.
 struct node_state {
-  // -- remote command infrastructure ------------------------------------------
-
-  /// Command callback for spawning components in the node.
-  static caf::message
-  spawn_command(const invocation& inv, caf::actor_system& sys);
-
-  /// Spawns a component for the NODE with given spawn arguments.
-  using component_factory_fun
-    = caf::expected<caf::actor> (*)(node_actor::stateful_pointer<node_state>,
-                                    spawn_arguments&);
-
-  /// Maps command names to a component factory.
-  using named_component_factory = std::map<std::string, component_factory_fun>;
-
-  /// Maps command names (including parent command) to spawn functions.
-  inline static named_component_factory component_factory = {};
-
-  /// Maps command names to functions.
-  inline static command::factory command_factory = {};
-
   // -- rest handling infrastructure -------------------------------------------
 
   using handler_and_endpoint = std::pair<rest_handler_actor, rest_endpoint>;
@@ -74,8 +53,15 @@ struct node_state {
   /// The component registry.
   component_registry registry = {};
 
+  /// The list of component plugin actors in the order that they were spawned.
+  std::vector<std::string> ordered_components = {};
+
   /// Components that are still alive for lifetime-tracking.
   std::set<std::pair<caf::actor_addr, std::string>> alive_components = {};
+
+  /// Map from component actor address to name for better error messages. Never
+  /// cleared.
+  std::unordered_map<caf::actor_addr, std::string> component_names = {};
 
   /// Counters for multi-instance components.
   std::unordered_map<std::string, uint64_t> label_counters = {};
