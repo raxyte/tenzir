@@ -212,11 +212,11 @@ void multi_series_builder::complete_last_event() {
             return fmt::format("{}", v);
           }
         },
-        [](const caf::none_t& ) -> std::string {
-          return "null"; //TODO this is a magic constant.
+        [](const caf::none_t&) -> std::string {
+          return "null"; // TODO this is a magic constant.
         },
         [](const blob&) -> std::string {
-          TENZIR_ASSERT(false, "A `blob` cannot be used as the selector field" );
+          TENZIR_ASSERT(false, "A `blob` cannot be used as the selector field");
           TENZIR_UNREACHABLE();
           return {};
         },
@@ -283,13 +283,11 @@ std::optional<size_t> multi_series_builder::next_free_index() const {
 
 auto multi_series_builder::type_for_schema(std::string_view name)
   -> const tenzir::type* {
-  const auto it = std::ranges::find(schemas_, name, [](const tenzir::type& t) {
-    return t.name();
-  });
+  const auto it = schemas_.find(name);
   if (it == std::ranges::end(schemas_)) {
     return nullptr;
   } else {
-    return &*it;
+    return std::addressof(it->second);
   }
 }
 

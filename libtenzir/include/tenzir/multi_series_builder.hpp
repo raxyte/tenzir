@@ -322,8 +322,12 @@ public:
                        Parser&& parser, std::vector<type> schemas = {})
     : policy_{std::move(policy)},
       settings_{std::move(settings)},
-      parser_{std::forward<Parser>(parser)},
-      schemas_{std::move(schemas)} {
+      parser_{std::forward<Parser>(parser)} {
+    schemas_.reserve(schemas.size());
+    for (auto t : schemas) {
+      const auto [it, success] = schemas_.try_emplace(t.name(), std::move(t));
+      TENZIR_ASSERT(success, "Repeated schema name");
+    }
     if (auto p = get_policy<policy_merge>()) {
       settings_.ordered = true; // merging mode is necessarily ordered
       merging_builder_ = series_builder{
@@ -385,7 +389,8 @@ private:
 
   /// appends `new_events` to `ready_events_`
   /// TODO Improvement: The `series_builder` could take in a vector instead of
-  /// returning one from flush(). That way would could write into an existing allocation
+  /// returning one from flush(). That way would could write into an existing
+  /// allocation
   void append_ready_events(std::vector<series>&& new_events);
 
   /// GCs `series_builders` from `entries_` that satisfy the predicate
@@ -396,10 +401,12 @@ private:
   constexpr static size_t invalid_index = static_cast<size_t>(-1);
   using signature_type = typename record_builder::signature_type;
 
+  struct schema_lookup_element;
+
   policy_type policy_;
   settings_type settings_;
   parser_function_type parser_;
-  std::vector<type> schemas_;
+  detail::flat_map<std::string, tenzir::type> schemas_;
 
   record_builder builder_raw_;
   signature_type signature_raw_;
@@ -413,5 +420,4 @@ private:
     = std::chrono::steady_clock::now();
   size_t active_index_ = 0;
 };
-
 } // namespace tenzir
