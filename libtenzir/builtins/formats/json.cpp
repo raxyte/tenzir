@@ -368,12 +368,18 @@ private:
   bool raw_;
 };
 
-auto unflatten_if_needed(std::string_view separator,
-                         table_slice slice) -> table_slice {
-  if (separator.empty()) {
-    return slice;
+auto json_string_parser(std::string_view s, const tenzir::type* seed)
+  -> caf::expected<tenzir::data> {
+  if (seed) {
+    return record_builder::basic_seeded_parser(s, *seed);
   }
-  return unflatten(slice, separator);
+  tenzir::data result;
+  constexpr static auto p = (parsers::data - parsers::number - parsers::number);
+  if (p(s, result)) {
+    return result;
+  } else {
+    return tenzir::data{std::string{s}};
+  }
 }
 
 class parser_base {
@@ -383,8 +389,8 @@ public:
               multi_series_builder::settings_type settings,
               std::vector<type> schemas, bool raw,
               std::optional<std::string> unnest)
-    : builder{std::move(policy), std::move(settings),
-              record_builder::basic_parser, std::move(schemas)},
+    : builder{std::move(policy), std::move(settings), json_string_parser,
+              std::move(schemas)},
       ctrl{ctrl},
       unnest{std::move(unnest)},
       raw{raw} {
@@ -563,12 +569,13 @@ auto parser_loop(generator<GeneratorValue> json_chunk_generator,
                  std::derived_from<parser_base> auto parser_impl)
   -> generator<table_slice> {
   for (auto chunk : json_chunk_generator) {
-    // get all events that are ready (timeout, batch size, ordered mode constraints)
+    // get all events that are ready (timeout, batch size, ordered mode
+    // constraints)
     for (auto slice :
          series_to_table_slice(parser_impl.builder.yield_ready())) {
       co_yield std::move(slice);
     }
-    for ( auto err : parser_impl.builder.last_errors() ) {
+    for (auto err : parser_impl.builder.last_errors()) {
       diagnostic::warning(err).emit(parser_impl.ctrl.diagnostics());
     }
     if (not chunk or chunk->size() == 0u) {
@@ -789,29 +796,6 @@ private:
   printer_args args_;
 };
 
-// TODO this can potentially be useful in other parsers
-struct common_parser_options_parser {
-  auto add_to_parser(argument_parser& parser) -> void {
-    parser.add("--raw", raw_);
-    parser.add("--unnest-separator", unnest_, "<nested-key-separator>");
-  }
-
-  auto write_into(parser_args& args) -> void {
-    args.raw = raw_;
-    if (unnest_.has_value()) {
-      if (unnest_->inner.empty()) {
-        diagnostic::error("`--unnest-separator` requires a non-empty separator")
-          .primary(unnest_->source)
-          .throw_();
-      }
-      args.unnest = unnest_->inner;
-    }
-  }
-
-private:
-  std::optional<located<std::string>> unnest_;
-  bool raw_ = false;
-};
 
 struct json_parser_options_parser {
   auto add_to_parser(argument_parser& parser) -> void {
@@ -845,21 +829,19 @@ public:
     -> std::unique_ptr<plugin_parser> override {
     auto parser
       = argument_parser{name(), "https://docs.tenzir.com/formats/json"};
-    multi_series_builder_settings_parser ps;
-    ps.add_to_parser(parser);
-    multi_series_builder_policy_parser pp;
-    pp.add_to_parser(parser);
+    multi_series_builder_argument_parser msb_parser{
+      {.default_name = "tenzir.json"}};
+    msb_parser.add_to_parser(parser);
     json_parser_options_parser pj;
     pj.add_to_parser(parser);
     common_parser_options_parser pc;
     pc.add_to_parser(parser);
     parser.parse(p);
-    auto settings = ps.get_settings();
-    auto policy = pp.validated_policy(settings, p);
-      //FIXME set defaultname for selector
-    auto args = parser_args{std::move(settings), std::move(policy)};
+    auto args
+      = parser_args{msb_parser.get_settings(), msb_parser.validated_policy(p)};
     pj.write_into(args, p);
-    pc.write_into(args);
+    args.unnest = pc.get_unnest();
+    args.raw = pc.get_raw();
     return std::make_unique<json_parser>(std::move(args));
   }
 
@@ -897,8 +879,10 @@ public:
     parser.parse(p);
     auto args = parser_args{};
     args.use_gelf_mode = true;
+    args.builder_settings.default_name = "gelf";
     args.builder_policy = multi_series_builder::policy_precise{};
-    pc.write_into(args);
+    args.unnest = pc.get_unnest();
+    args.raw = pc.get_raw();
     return std::make_unique<json_parser>(std::move(args));
   }
 };
@@ -916,13 +900,20 @@ public:
     auto parser = argument_parser{
       name(), fmt::format("https://docs.tenzir.com/formats/{}", name())};
     auto args = parser_args{};
-    //FIXME set default name correctly
-    multi_series_builder_settings_parser ps;
-    ps.add_to_parser(parser);
-    parser.parse(p);
-    args.use_ndjson_mode = true;
+    args.builder_settings = {
+      .default_name = std::string{Prefix.str()},
+    };
     args.builder_policy = multi_series_builder::policy_selector{
-      .field_name{Selector.str()}, .naming_prefix{Prefix.str()}};
+      .field_name = std::string{Selector.str()},
+      .naming_prefix = std::string{Prefix.str()},
+    };
+    add_schema_only_option(parser, args.builder_settings.schema_only);
+    common_parser_options_parser common_parser;
+    common_parser.add_to_parser(parser);
+    parser.parse(p);
+    args.unnest = common_parser.get_unnest();
+    args.raw = common_parser.get_raw();
+    args.use_ndjson_mode = true;
     auto sep_str = Separator.str();
     if (not sep_str.empty()) {
       args.unnest = std::move(sep_str);
