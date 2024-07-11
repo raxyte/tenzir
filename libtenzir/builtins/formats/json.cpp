@@ -796,28 +796,6 @@ private:
   printer_args args_;
 };
 
-
-struct json_parser_options_parser {
-  auto add_to_parser(argument_parser& parser) -> void {
-    parser.add("--ndjson", use_ndjson_mode_);
-    parser.add("--gelf", use_gelf_mode_);
-  }
-
-  auto write_into(parser_args& args, parser_interface& p) -> void {
-    if (use_ndjson_mode_ and use_gelf_mode_) {
-      diagnostic::error("`--ndjson` and `--gelf` are incompatible")
-        .primary(p.current_span())
-        .throw_();
-    }
-    args.use_ndjson_mode = use_ndjson_mode_;
-    args.use_gelf_mode = use_gelf_mode_;
-  }
-
-private:
-  bool use_gelf_mode_ = false;
-  bool use_ndjson_mode_ = false;
-};
-
 class plugin final : public virtual parser_plugin<json_parser>,
                      public virtual printer_plugin<json_printer> {
 public:
@@ -832,16 +810,32 @@ public:
     multi_series_builder_argument_parser msb_parser{
       {.default_name = "tenzir.json"}};
     msb_parser.add_to_parser(parser);
-    json_parser_options_parser pj;
-    pj.add_to_parser(parser);
-    common_parser_options_parser pc;
-    pc.add_to_parser(parser);
+    common_parser_options_parser common_parser;
+    common_parser.add_to_parser(parser);
+    bool use_ndjson_mode = false;
+    bool use_gelf_mode = false;
+    bool arrays_of_objects = false;
+    parser.add("--ndjson", use_ndjson_mode);
+    parser.add("--gelf", use_gelf_mode);
+    parser.add("--arrays-of-objects", arrays_of_objects);
     parser.parse(p);
+    if (use_ndjson_mode and use_gelf_mode) {
+      diagnostic::error("`--ndjson` and `--gelf` are incompatible")
+        .primary(p.current_span())
+        .throw_();
+    }
+    if ( use_ndjson_mode and arrays_of_objects ) {
+      diagnostic::error("`--ndjson` and `--arrays-of-objects` are incompatible")
+        .primary(p.current_span())
+        .throw_();
+    }
     auto args
-      = parser_args{msb_parser.get_settings(), msb_parser.validated_policy(p)};
-    pj.write_into(args, p);
-    args.unnest = pc.get_unnest();
-    args.raw = pc.get_raw();
+      = parser_args{msb_parser.get_settings(), msb_parser.validated_policy(p),};
+    args.unnest = common_parser.get_unnest();
+    args.raw = common_parser.get_raw();
+    args.use_ndjson_mode = use_ndjson_mode;
+    args.use_gelf_mode = use_gelf_mode;
+    args.arrays_of_objects = arrays_of_objects;
     return std::make_unique<json_parser>(std::move(args));
   }
 
