@@ -8,7 +8,6 @@
 
 #include "tenzir/detail/add_message_types.hpp"
 
-#include "tenzir/accountant_config.hpp"
 #include "tenzir/actors.hpp"
 #include "tenzir/atoms.hpp"
 #include "tenzir/bitmap.hpp"
@@ -36,7 +35,6 @@
 #include "tenzir/query_cursor.hpp"
 #include "tenzir/query_options.hpp"
 #include "tenzir/query_status.hpp"
-#include "tenzir/report.hpp"
 #include "tenzir/resource.hpp"
 #include "tenzir/series.hpp"
 #include "tenzir/shared_diagnostic_handler.hpp"
