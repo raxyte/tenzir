@@ -63,6 +63,7 @@ CAF_BEGIN_TYPE_ID_BLOCK(tenzir_atoms, caf::id_block::tenzir_types::end)
   TENZIR_ADD_ATOM(normalize, "normalize")
   TENZIR_ADD_ATOM(package_add, "padd")
   TENZIR_ADD_ATOM(package_remove, "premove")
+  TENZIR_ADD_ATOM(package_initial, "pinitial");
   TENZIR_ADD_ATOM(pause, "pause")
   TENZIR_ADD_ATOM(persist, "persist")
   TENZIR_ADD_ATOM(ping, "ping")

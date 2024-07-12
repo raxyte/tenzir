@@ -434,28 +434,34 @@ using pipeline_executor_actor = typed_actor_fwd<
   auto(atom::resume)->caf::result<void>>::unwrap;
 
 /// The interface of a PACKAGE LISTENER actor.
+// Listeners are notified in the following order:
+//  1. context_manager component
+//  2. pipeline_manager component
+//  3. other subscribers (tbd)
 using package_listener_actor = typed_actor_fwd<
   // Add a new package.
-  // Subscribers are notified in the following order:
-  //  1. context_manager component
-  //  2. pipeline_manager component
-  //  3. other subscribers
   auto(atom::package_add, package)->caf::result<void>,
   // Remove all pipelines from a package.
-  auto(atom::package_remove, std::string)->caf::result<void>>::unwrap;
+  auto(atom::package_remove, std::string)->caf::result<void>,
+  // Send the list of packages that were found on disk
+  // during startup. Listeners should use this information
+  // to purge left-over state from packages that were
+  // removed in the meantime.
+  auto(atom::package_initial, std::vector<std::string>)
+    ->caf::result<void>>::unwrap;
 
-using package_provider_actor = typed_actor_fwd<
-  // Register as subscriber and get the initial state.
-  // Subscribers get the data in a two-step process:
-  //  1. As a response to the subscription message they
-  //     get a list of packages that were recovered from the on-disk state
-  //     of the previous run of the node.
-  //     This allows the subscribers to get rid of any left-over files that
-  //     were created by packages that have subsequently been removed.
-  //  2. The packages that are still installed are added via the regular
-  //     `package_add` subscription call.
-  auto(atom::subscribe, package_listener_actor)
-    ->caf::result<std::vector<std::string>>>::unwrap;
+// using package_provider_actor = typed_actor_fwd<
+//   // Register as subscriber and get the initial state.
+//   // Subscribers get the data in a two-step process:
+//   //  1. As a response to the subscription message they
+//   //     get a list of packages that were recovered from the on-disk state
+//   //     of the previous run of the node.
+//   //     This allows the subscribers to get rid of any left-over files that
+//   //     were created by packages that have subsequently been removed.
+//   //  2. The packages that are still installed are added via the regular
+//   //     `package_add` subscription call.
+//   auto(atom::subscribe, package_listener_actor)
+//     ->caf::result<std::vector<std::string>>>::unwrap;
 
 using terminator_actor = typed_actor_fwd<
   // Shut down the given actors.
