@@ -174,7 +174,7 @@ public:
     const auto* ssv_plugin = plugins::find<printer_parser_plugin>("ssv");
     TENZIR_DIAG_ASSERT(ssv_plugin);
     auto diag = null_diagnostic_handler{};
-    auto parser = tql::make_parser_interface("--no-header", diag);
+    auto parser = tql::make_parser_interface("--no-header --no-escape", diag);
     TENZIR_DIAG_ASSERT(parser);
     auto result = ssv_plugin->parse_printer(*parser);
     TENZIR_DIAG_ASSERT(result);
