@@ -36,6 +36,7 @@ struct xsv_options {
   char field_sep = {};
   char list_sep = {};
   bool no_header = {};
+  bool no_escape = {};
   bool allow_comments = {};
   bool auto_expand = {};
   std::string null_value = {};
@@ -114,13 +115,14 @@ struct xsv_options {
       f.field("list_sep", x.list_sep), f.field("null_value", x.null_value),
       f.field("allow_comments", x.allow_comments),
       f.field("auto_expand", x.auto_expand), f.field("header", x.header),
-      f.field("no_header", x.no_header));
+      f.field("no_header", x.no_header),
+      f.field("no_escape", x.no_escape));
   }
 };
 
 struct xsv_printer_impl {
-  xsv_printer_impl(char sep, char list_sep, std::string null)
-    : sep{sep}, list_sep{list_sep}, null{std::move(null)} {
+  xsv_printer_impl(char sep, char list_sep, std::string null, bool no_escape)
+    : sep{sep}, list_sep{list_sep}, no_escape{no_escape}, null{std::move(null)} {
   }
 
   template <typename It>
@@ -181,7 +183,7 @@ struct xsv_printer_impl {
 
     auto operator()(view<std::string> x) noexcept -> bool {
       sequence_empty = false;
-      auto needs_escaping = std::any_of(x.begin(), x.end(), [this](auto c) {
+      auto needs_escaping = not printer.no_escape && std::any_of(x.begin(), x.end(), [this](auto c) {
         return c == printer.sep || c == '"';
       });
       if (needs_escaping) {
@@ -246,6 +248,7 @@ struct xsv_printer_impl {
 
   char sep{','};
   char list_sep{';'};
+  bool no_escape{};
   std::string null{};
 };
 
@@ -462,7 +465,7 @@ public:
           co_return;
         }
         auto printer
-          = xsv_printer_impl{args.field_sep, args.list_sep, args.null_value};
+          = xsv_printer_impl{args.field_sep, args.list_sep, args.null_value, args.no_escape};
         auto buffer = std::vector<char>{};
         auto out_iter = std::back_inserter(buffer);
         auto resolved_slice = flatten(resolve_enumerations(slice)).slice;
@@ -566,12 +569,15 @@ public:
     -> std::unique_ptr<plugin_printer> override {
     auto parser = argument_parser{name()};
     bool no_header = {};
+    bool no_escape = {};
     parser.add("--no-header", no_header);
+    parser.add("--no-escape", no_escape);
     parser.parse(p);
     return std::make_unique<xsv_printer>(xsv_options{
       .field_sep = Sep,
       .list_sep = ListSep,
       .no_header = no_header,
+      .no_escape = no_escape,
       .allow_comments = false,
       .auto_expand = false,
       .null_value = std::string{Null.str()},
