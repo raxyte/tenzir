@@ -680,10 +680,10 @@ public:
       return then_ty;
     }
     // TODO: Improve diagnostic.
-    auto diag = diagnostic::error("incompatible branch output types: {} and {}",
-                                  fmt::to_string(*then_ty),
-                                  fmt::to_string(*else_ty))
-                  .primary(branch_location(args_.consequence));
+    auto diag
+      = diagnostic::error("incompatible branch output types: {} and {}",
+                          fmt::to_string(*then_ty), fmt::to_string(*else_ty))
+          .primary(branch_location(args_.consequence));
     if (args_.alternative) {
       diag = std::move(diag).secondary(branch_location(*args_.alternative));
     }
